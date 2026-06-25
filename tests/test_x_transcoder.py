@@ -1,0 +1,55 @@
+from pathlib import Path
+import unittest
+from unittest import mock
+
+import x_transcoder as xt
+
+
+def media_info(**overrides):
+    values = {
+        "path": Path("downloads/input.mp4"),
+        "container": "mov,mp4,m4a,3gp,3g2,mj2",
+        "size": 2_000_000,
+        "duration": 10.0,
+        "video_codec": "h264",
+        "video_profile": "High",
+        "width": 1080,
+        "height": 1920,
+        "fps": 30.0,
+        "pixel_format": "yuv420p",
+        "video_bit_rate": 1_000_000,
+        "audio_codec": "aac",
+        "audio_bit_rate": 128_000,
+    }
+    values.update(overrides)
+    return xt.MediaInfo(**values)
+
+
+class XTranscoderTests(unittest.TestCase):
+    def test_h264_aac_mp4_is_compatible(self) -> None:
+        result = xt.check_with_options(media_info(), xt.default_options())
+        self.assertTrue(result.ok, result.reasons)
+
+    def test_hevc_is_not_compatible(self) -> None:
+        result = xt.check_with_options(media_info(video_codec="hevc"), xt.default_options())
+        self.assertFalse(result.ok)
+        self.assertTrue(any("video codec is hevc" in reason for reason in result.reasons))
+
+    def test_target_dimensions_do_not_upscale(self) -> None:
+        self.assertEqual(xt.target_dimensions(media_info(width=576, height=1024), (1920, 1080), (1080, 1920)), (576, 1024))
+
+    def test_target_dimensions_scale_large_portrait(self) -> None:
+        self.assertEqual(xt.target_dimensions(media_info(width=2160, height=3840), (1920, 1080), (1080, 1920)), (1080, 1920))
+
+    def test_default_output_path_adds_suffix(self) -> None:
+        path = xt.output_path_for(Path("downloads/a.mp4"), None, None, "_x")
+        self.assertEqual(path, Path("downloads/a_x.mp4"))
+
+    def test_time_named_output_path(self) -> None:
+        with mock.patch("x_transcoder.time.strftime", return_value="20260624_153012"):
+            path = xt.output_path_for(Path("downloads/a.mp4"), None, None, "_x", use_time_name=True)
+        self.assertEqual(path, Path("downloads/20260624_153012_x.mp4"))
+
+
+if __name__ == "__main__":
+    unittest.main()
