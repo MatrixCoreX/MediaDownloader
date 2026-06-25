@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -77,6 +78,26 @@ KUAISHOU_DOMAINS = ("kuaishou.com", "gifshow.com", "ksurl.cn", "kwai.com", "v.ku
 XIAOHONGSHU_DOMAINS = ("xiaohongshu.com", "xhslink.com", "xhscdn.com", "xhs.cn")
 PLATFORMS = ("auto", "douyin", "kuaishou", "xiaohongshu")
 OUTPUT_TIME_FORMAT = "%Y%m%d_%H%M%S"
+CHROMIUM_BROWSER_EXECUTABLES = (
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+    "microsoft-edge",
+    "microsoft-edge-stable",
+    "msedge",
+    "brave-browser",
+    "brave",
+    "vivaldi",
+    "vivaldi-stable",
+    "chrome.exe",
+    "msedge.exe",
+    "brave.exe",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+)
 
 
 class DouyinDownloadError(RuntimeError):
@@ -371,6 +392,20 @@ def looks_like_play_url(url: str) -> bool:
     )
 
 
+def looks_like_douyin_browser_video_url(url: str) -> bool:
+    lowered = unwrap_url(url).lower()
+    if not lowered.startswith(("http://", "https://", "//")):
+        return False
+    parsed = urllib.parse.urlsplit(lowered)
+    host = parsed.netloc
+    path = parsed.path
+    if "douyinvod.com" in host:
+        return "mime_type=video" in lowered or ".mp4" in path or "/video/tos/" in path
+    if host.endswith("douyinstatic.com"):
+        return False
+    return "/video/tos/" in path and "mime_type=video" in lowered
+
+
 def looks_like_kuaishou_video_url(url: str) -> bool:
     lowered = unwrap_url(url).lower()
     if not lowered.startswith(("http://", "https://", "//")):
@@ -394,7 +429,7 @@ def looks_like_platform_video_url(url: str, platform: str) -> bool:
         return looks_like_kuaishou_video_url(url)
     if platform == "xiaohongshu":
         return looks_like_xiaohongshu_video_url(url)
-    return looks_like_play_url(url)
+    return looks_like_play_url(url) or looks_like_douyin_browser_video_url(url)
 
 
 def add_candidate(
@@ -610,6 +645,185 @@ def extract_candidates_from_html(page_text: str) -> list[Candidate]:
     return sorted(candidates, key=lambda candidate: candidate.priority)
 
 
+def find_chrome_executable(chrome_path: str | None = None) -> str | None:
+    if chrome_path:
+        expanded = Path(chrome_path).expanduser()
+        if expanded.exists():
+            return str(expanded)
+        return shutil.which(chrome_path)
+    for executable in CHROMIUM_BROWSER_EXECUTABLES:
+        executable_path = Path(executable).expanduser()
+        if executable_path.exists():
+            return str(executable_path)
+        found = shutil.which(executable)
+        if found:
+            return found
+    return None
+
+
+def browser_fallback_was_unavailable(logs: Iterable[str]) -> bool:
+    return any("Browser fallback skipped:" in line for line in logs)
+
+
+def iter_netlog_urls(payload: Any) -> Iterable[str]:
+    url_pattern = re.compile(r"https?://[^\s\"'<>\\]+")
+    for value in iter_strings(payload):
+        if value.startswith(("http://", "https://")):
+            yield value
+            continue
+        for match in url_pattern.finditer(value):
+            yield match.group(0)
+
+
+def browser_candidate_priority(url: str, platform: str, index: int) -> int:
+    if platform == "douyin":
+        parsed = urllib.parse.urlsplit(unwrap_url(url))
+        query = urllib.parse.parse_qs(parsed.query)
+        for key in ("bt", "br"):
+            raw_value = (query.get(key) or [""])[0]
+            try:
+                value = int(raw_value)
+            except ValueError:
+                continue
+            if value > 0:
+                return max(1, 1_000_000 - min(value, 999_999))
+    return 5_000_000 + index
+
+
+def extract_browser_candidates_from_netlog_payload(payload: Any, platform: str) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    seen: set[str] = set()
+    for index, raw_url in enumerate(iter_netlog_urls(payload)):
+        if looks_like_platform_video_url(raw_url, platform):
+            add_platform_candidate(
+                candidates,
+                seen,
+                raw_url,
+                f"{platform}.browser-netlog",
+                browser_candidate_priority(raw_url, platform, index),
+                platform,
+            )
+    return sorted(candidates, key=lambda candidate: candidate.priority)
+
+
+def gather_browser_candidates(
+    share_text: str,
+    *,
+    platform: str,
+    cookie: str | None = None,
+    timeout: float = 12.0,
+    chrome_path: str | None = None,
+) -> tuple[str | None, list[Candidate], list[str]]:
+    urls = extract_urls(share_text)
+    if not urls:
+        if share_text.strip().startswith(("http://", "https://")):
+            urls = [share_text.strip()]
+        else:
+            raise DouyinDownloadError("No URL found in the share text.")
+
+    logs: list[str] = []
+    chrome = find_chrome_executable(chrome_path)
+    if not chrome:
+        logs.append(
+            "Browser fallback skipped: no Chromium-compatible browser was found. "
+            "Install Chrome, Chromium, Edge, Brave, or pass --chrome-path."
+        )
+        return extract_platform_id(platform, share_text), [], logs
+    if cookie:
+        logs.append("Browser fallback uses a fresh local Chrome profile; --cookie only applies to direct HTTP parsing.")
+
+    item_id = extract_platform_id(platform, share_text)
+    candidates: list[Candidate] = []
+    seen: set[str] = set()
+    target_urls: list[str] = []
+
+    for share_url in urls:
+        try:
+            resolved = http_get(
+                share_url,
+                cookie=cookie,
+                timeout=min(timeout, 20.0),
+                max_bytes=256 * 1024,
+                extra_headers={"Referer": platform_referer(platform)},
+            )
+            page_text = decode_text(resolved.content, resolved.headers)
+            item_id = item_id or extract_platform_id(platform, resolved.url, page_text)
+            if resolved.url not in target_urls:
+                target_urls.append(resolved.url)
+        except DouyinDownloadError as exc:
+            logs.append(f"{platform}: browser fallback pre-resolve failed: {exc}")
+        if share_url not in target_urls:
+            target_urls.append(share_url)
+
+    for target_url in target_urls:
+        with tempfile.TemporaryDirectory(prefix="media_downloader_chrome_") as tmpdir:
+            netlog_path = Path(tmpdir) / "netlog.json"
+            command = [
+                chrome,
+                "--headless=new",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--mute-audio",
+                "--autoplay-policy=no-user-gesture-required",
+                f"--user-data-dir={tmpdir}",
+                f"--log-net-log={netlog_path}",
+                "--net-log-capture-mode=IncludeSensitive",
+                f"--virtual-time-budget={max(1000, int(timeout * 1000))}",
+                "--dump-dom",
+                target_url,
+            ]
+            logs.append(f"{platform}: browser fallback opening {target_url}")
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout + 10,
+                )
+            except subprocess.TimeoutExpired:
+                logs.append(f"{platform}: browser fallback timed out after {timeout:.1f}s")
+                continue
+            except OSError as exc:
+                logs.append(f"{platform}: browser fallback failed to start Chrome: {exc}")
+                continue
+
+            if completed.returncode != 0:
+                stderr_line = completed.stderr.strip().splitlines()
+                detail = f": {stderr_line[0]}" if stderr_line else ""
+                logs.append(f"{platform}: browser fallback Chrome exited with {completed.returncode}{detail}")
+
+            item_id = item_id or extract_platform_id(platform, target_url, completed.stdout)
+            for candidate in extract_platform_candidates_from_html(completed.stdout, platform):
+                add_platform_candidate(
+                    candidates,
+                    seen,
+                    candidate.url,
+                    f"{candidate.source}:browser-dom",
+                    candidate.priority + 2_000_000,
+                    platform,
+                )
+
+            if not netlog_path.exists():
+                logs.append(f"{platform}: browser fallback produced no network log")
+                continue
+            try:
+                payload = json.loads(netlog_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                logs.append(f"{platform}: browser fallback could not parse network log: {exc}")
+                continue
+
+            netlog_candidates = extract_browser_candidates_from_netlog_payload(payload, platform)
+            logs.append(f"{platform}: browser fallback found {len(netlog_candidates)} network video candidate(s)")
+            for candidate in netlog_candidates:
+                add_platform_candidate(candidates, seen, candidate.url, candidate.source, candidate.priority, platform)
+            if candidates:
+                break
+
+    return item_id, sorted(candidates, key=lambda candidate: candidate.priority), logs
+
+
 def detail_api_urls(aweme_id: str) -> list[str]:
     encoded = urllib.parse.quote(aweme_id)
     return [
@@ -663,6 +877,11 @@ def gather_candidates(
             if payload is None:
                 logs.append(f"Detail API returned non-JSON: {result.url}")
                 continue
+            if isinstance(payload, dict):
+                status_code = payload.get("status_code")
+                status_msg = payload.get("status_msg")
+                if status_code not in (None, 0):
+                    logs.append(f"Detail API returned status_code={status_code}: {status_msg or '<no message>'}")
 
             for candidate in extract_candidates_from_json(payload):
                 add_candidate(all_candidates, seen_candidates, candidate.url, candidate.source, candidate.priority)
@@ -741,6 +960,9 @@ def gather_candidates_for_request(
     platform: str,
     cookie: str | None = None,
     timeout: float = 20.0,
+    browser_fallback: bool = True,
+    browser_timeout: float = 12.0,
+    chrome_path: str | None = None,
 ) -> tuple[str, str | None, list[Candidate], list[str]]:
     resolved_platform = detect_platform(share_text) if platform == "auto" else platform
     if not resolved_platform:
@@ -751,6 +973,18 @@ def gather_candidates_for_request(
 
     if resolved_platform == "douyin":
         item_id, candidates, logs = gather_candidates(share_text, cookie=cookie, timeout=timeout)
+        if not candidates and browser_fallback:
+            logs.append("douyin: direct extraction found no candidates, trying browser fallback")
+            browser_item_id, browser_candidates, browser_logs = gather_browser_candidates(
+                share_text,
+                platform=resolved_platform,
+                cookie=cookie,
+                timeout=browser_timeout,
+                chrome_path=chrome_path,
+            )
+            logs.extend(browser_logs)
+            item_id = item_id or browser_item_id
+            candidates = browser_candidates
         return resolved_platform, item_id, candidates, logs
 
     if resolved_platform in {"kuaishou", "xiaohongshu"}:
@@ -760,6 +994,18 @@ def gather_candidates_for_request(
             cookie=cookie,
             timeout=timeout,
         )
+        if not candidates and browser_fallback:
+            platform_logs.append(f"{resolved_platform}: direct extraction found no candidates, trying browser fallback")
+            browser_item_id, browser_candidates, browser_logs = gather_browser_candidates(
+                share_text,
+                platform=resolved_platform,
+                cookie=cookie,
+                timeout=browser_timeout,
+                chrome_path=chrome_path,
+            )
+            platform_logs.extend(browser_logs)
+            item_id = item_id or browser_item_id
+            candidates = browser_candidates
         return resolved_platform, item_id, candidates, platform_logs
 
     raise DouyinDownloadError(f"Unsupported platform: {resolved_platform}")
@@ -1007,6 +1253,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=20.0,
         help="Network timeout in seconds. Default: 20",
     )
+    browser_group = parser.add_mutually_exclusive_group()
+    browser_group.add_argument(
+        "--browser-fallback",
+        dest="browser_fallback",
+        action="store_true",
+        default=True,
+        help="Use local Chrome/Chromium network-log fallback when direct extraction finds no video. Default: enabled",
+    )
+    browser_group.add_argument(
+        "--no-browser-fallback",
+        dest="browser_fallback",
+        action="store_false",
+        help="Disable the local Chrome/Chromium fallback.",
+    )
+    parser.add_argument(
+        "--browser-timeout",
+        type=float,
+        default=12.0,
+        help="Seconds to let browser fallback load the page. Default: 12",
+    )
+    parser.add_argument(
+        "--chrome-path",
+        help="Path or executable name for the Chromium-compatible browser used by fallback.",
+    )
     parser.add_argument(
         "--print-url",
         action="store_true",
@@ -1078,6 +1348,9 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
         platform=args.platform,
         cookie=cookie,
         timeout=args.timeout,
+        browser_fallback=args.browser_fallback,
+        browser_timeout=args.browser_timeout,
+        chrome_path=args.chrome_path,
     )
 
     if args.verbose:
@@ -1091,10 +1364,17 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
             )
 
     if not candidates:
-        raise DouyinDownloadError(
+        message = (
             "No downloadable video URL was found. The post may be private, unavailable, "
             "or the platform may require a browser cookie for this page."
         )
+        if args.browser_fallback and browser_fallback_was_unavailable(logs):
+            message += (
+                " Direct extraction still ran, but the optional browser fallback was unavailable "
+                "because no Chromium-compatible browser was found. Install Chrome, Chromium, "
+                "Edge, Brave, or pass --chrome-path; use --no-browser-fallback to skip this check."
+            )
+        raise DouyinDownloadError(message)
 
     best = candidates[0]
     if args.print_url:

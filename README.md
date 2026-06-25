@@ -14,6 +14,8 @@
 
 默认平台模式是 `--platform auto`，会根据分享链接自动识别平台。所有平台都只使用直连解析，不调用第三方解析网站。
 
+抖音等页面如果不再把公开视频地址直接写在 HTML/API 里，脚本会默认启动本机 Chromium 系浏览器无头模式，读取本机网络日志中的公开视频请求地址作为 fallback。这仍然不调用第三方解析网站。
+
 ## 使用
 
 ```bash
@@ -46,6 +48,18 @@ python3 media_downloader.py --platform douyin "抖音分享文案或链接"
 
 ```bash
 python3 media_downloader.py --print-url "https://v.douyin.com/xxxx/"
+```
+
+禁用本机浏览器 fallback，只使用纯 HTTP 直连解析：
+
+```bash
+python3 media_downloader.py --no-browser-fallback "https://v.douyin.com/xxxx/"
+```
+
+指定浏览器路径或调大浏览器加载时间：
+
+```bash
+python3 media_downloader.py --chrome-path /usr/bin/google-chrome --browser-timeout 25 "https://v.douyin.com/xxxx/"
 ```
 
 从文件或管道读取：
@@ -106,7 +120,7 @@ python3 x_transcoder.py downloads/input.mp4
 
 ## 依赖
 
-默认解析模式只需要 Python 3 标准库。
+默认解析模式只需要 Python 3 标准库。浏览器 fallback 是可选增强，支持 Chrome、Chromium、Microsoft Edge、Brave、Vivaldi 等 Chromium 系浏览器；如果没有安装，脚本会跳过 fallback 并只使用直连解析。可用 `--no-browser-fallback` 主动关闭，也可以用 `--chrome-path` 指定浏览器路径。
 
 `--show-info` 需要系统安装 `ffprobe`。如果没有安装，工具仍会下载视频，但只能显示文件大小。
 
