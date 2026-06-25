@@ -1292,18 +1292,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Print resolution, duration, codec, bitrate, and file size after download.",
     )
-    x_group = parser.add_mutually_exclusive_group()
-    x_group.add_argument(
+    parser.add_argument(
         "--x-compatible",
         action="store_true",
-        default=True,
-        help="After download, auto-transcode unsupported formats to X-compatible H.264/AAC MP4.",
+        default=False,
+        help="After download, check and auto-transcode unsupported formats to X-compatible H.264/AAC MP4.",
     )
-    x_group.add_argument(
+    parser.add_argument(
         "--no-x-compatible",
         dest="x_compatible",
         action="store_false",
-        help="Skip the default X-compatible check/transcode step after download.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--x-force",

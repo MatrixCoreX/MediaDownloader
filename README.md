@@ -2,7 +2,7 @@
 
 一个命令行工具：粘贴抖音、快手或小红书分享文案/链接，解析可访问的视频地址，并下载为 MP4。
 
-默认输出文件名使用本地时间，例如 `20260624_153012.mp4`。如果需要自动转成 X 兼容格式，下载脚本会沿用同一个时间名并加 `_x`，例如 `20260624_153012_x.mp4`。单独运行转码工具时，默认也会生成当前时间命名的 `_x.mp4`。
+默认输出文件名使用本地时间，例如 `20260624_153012.mp4`。默认只下载原视频；如果启动时加 `--x-compatible`，下载脚本会检查并在需要时自动生成 X 兼容格式，文件名沿用同一个时间名并加 `_x`，例如 `20260624_153012_x.mp4`。单独运行转码工具时，默认也会生成当前时间命名的 `_x.mp4`。
 
 主程序文件名是 `media_downloader.py`。
 
@@ -87,22 +87,22 @@ python3 media_downloader.py -o videos --output-name my_video.mp4 "https://v.douy
 python3 media_downloader.py --show-info "https://v.douyin.com/xxxx/"
 ```
 
-下载完成后会默认检查 X 上传兼容性；如果不是 X 稳定支持的 H.264/AAC MP4，会自动生成 `_x.mp4`：
+下载完成后默认只保存原文件。如果需要检查 X 上传兼容性，并在格式不符合时自动生成 H.264/AAC MP4，加 `--x-compatible`：
+
+```bash
+python3 media_downloader.py --x-compatible "https://v.douyin.com/xxxx/"
+```
+
+交互模式也可以启用 X 兼容检查和转码：
+
+```bash
+python3 media_downloader.py --interactive --x-compatible
+```
+
+只下载原文件，不做 X 兼容性检查和转码：
 
 ```bash
 python3 media_downloader.py "https://v.douyin.com/xxxx/"
-```
-
-交互模式同样会自动检查和转码：
-
-```bash
-python3 media_downloader.py --interactive
-```
-
-如果只想下载原文件，不做 X 兼容性检查和转码：
-
-```bash
-python3 media_downloader.py --no-x-compatible "https://v.douyin.com/xxxx/"
 ```
 
 单独转码最新下载的视频：
@@ -124,7 +124,7 @@ python3 x_transcoder.py downloads/input.mp4
 
 `--show-info` 需要系统安装 `ffprobe`。如果没有安装，工具仍会下载视频，但只能显示文件大小。
 
-默认 X 兼容检查/转码和 `x_transcoder.py` 需要系统安装 `ffmpeg` 和 `ffprobe`。如果暂时不需要转码，可使用 `--no-x-compatible`。
+`--x-compatible` 和 `x_transcoder.py` 需要系统安装 `ffmpeg` 和 `ffprobe`。不加 `--x-compatible` 时，主下载脚本不会执行 X 兼容检查或转码。
 
 ## 说明
 
