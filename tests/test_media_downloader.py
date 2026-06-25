@@ -69,6 +69,10 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertFalse(dd.parse_args([]).x_compatible)
         self.assertTrue(dd.parse_args(["--x-compatible"]).x_compatible)
 
+    def test_interactive_x_compatible_requires_explicit_flag(self) -> None:
+        self.assertFalse(dd.parse_args(["--interactive"]).x_compatible)
+        self.assertTrue(dd.parse_args(["--interactive", "--x-compatible"]).x_compatible)
+
     def test_browser_fallback_is_enabled_by_default(self) -> None:
         self.assertTrue(dd.parse_args([]).browser_fallback)
         self.assertFalse(dd.parse_args(["--no-browser-fallback"]).browser_fallback)
