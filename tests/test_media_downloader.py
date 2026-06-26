@@ -1,3 +1,4 @@
+import io
 import sys
 import unittest
 from unittest import mock
@@ -99,6 +100,34 @@ class DouyinDownloaderTests(unittest.TestCase):
             with self.assertRaises(dd.DouyinDownloadError) as raised:
                 dd.handle_share_text(args, args.share, None)
         self.assertIn("optional browser fallback was unavailable", str(raised.exception))
+
+    def test_handle_share_text_prints_video_media_type(self) -> None:
+        args = dd.parse_args(["--print-url", "https://v.douyin.com/abc123/"])
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("douyin", "7441234567890123456", [candidate], [], []),
+        ):
+            with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+        self.assertIn("detected_media: video", stderr.getvalue())
+
+    def test_handle_share_text_prints_image_media_type(self) -> None:
+        args = dd.parse_args(["--print-url", "https://www.xiaohongshu.com/discovery/item/abc"])
+        image_candidate = dd.ImageCandidate("https://example.com/image.jpg", "test", 1)
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("xiaohongshu", "abc", [], [image_candidate], []),
+        ):
+            with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+        self.assertIn("detected_media: images", stderr.getvalue())
 
     def test_platform_defaults_to_auto(self) -> None:
         self.assertEqual(dd.parse_args([]).platform, "auto")

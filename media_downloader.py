@@ -952,7 +952,7 @@ def gather_browser_candidates(
             target_urls.append(share_url)
 
     for target_url in target_urls:
-        with tempfile.TemporaryDirectory(prefix="media_downloader_chrome_") as tmpdir:
+        with tempfile.TemporaryDirectory(prefix="media_downloader_chrome_", ignore_cleanup_errors=True) as tmpdir:
             netlog_path = Path(tmpdir) / "netlog.json"
             command = [
                 chrome,
@@ -1564,6 +1564,14 @@ def read_share_text(args: argparse.Namespace) -> str:
     raise DouyinDownloadError("Pass share text as an argument, --input-file, or stdin.")
 
 
+def media_type_message(platform: str, candidates: list[Candidate], image_candidates: list[ImageCandidate]) -> str:
+    if candidates:
+        return f"detected_media: video (platform={platform}, candidates={len(candidates)})"
+    if image_candidates:
+        return f"detected_media: images (platform={platform}, count={len(image_candidates)})"
+    return f"detected_media: unknown (platform={platform})"
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download accessible Douyin, Kuaishou, or Xiaohongshu media from copied share text.",
@@ -1734,8 +1742,10 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
                 " Direct extraction still ran, but the optional browser fallback was unavailable "
                 "because no Chromium-compatible browser was found. Install Chrome, Chromium, "
                 "Edge, Brave, or pass --chrome-path; use --no-browser-fallback to skip this check."
-            )
+        )
         raise DouyinDownloadError(message)
+
+    print(media_type_message(platform, candidates, image_candidates), file=sys.stderr)
 
     if args.print_url:
         if candidates:

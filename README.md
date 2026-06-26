@@ -16,6 +16,8 @@
 
 抖音等页面如果不再把公开视频地址直接写在 HTML/API 里，脚本会默认启动本机 Chromium 系浏览器无头模式，读取本机网络日志中的公开视频请求地址作为 fallback。这仍然不调用第三方解析网站。
 
+每次解析成功后，终端都会提示媒体类型，例如 `detected_media: video` 或 `detected_media: images`。这个提示会输出到 stderr，URL 和保存路径仍保持在 stdout，方便管道处理。
+
 ## 使用
 
 ```bash
