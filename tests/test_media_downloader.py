@@ -89,7 +89,7 @@ class DouyinDownloaderTests(unittest.TestCase):
         logs = ["Browser fallback skipped: no Chromium-compatible browser was found."]
         with mock.patch(
             "media_downloader.gather_candidates_for_request",
-            return_value=("douyin", "7441234567890123456", [], logs),
+            return_value=("douyin", "7441234567890123456", [], [], logs),
         ):
             with self.assertRaises(dd.DouyinDownloadError) as raised:
                 dd.handle_share_text(args, args.share, None)
@@ -125,6 +125,29 @@ class DouyinDownloaderTests(unittest.TestCase):
         }
         candidates = dd.extract_browser_candidates_from_netlog_payload(payload, "douyin")
         self.assertEqual([candidate.url for candidate in candidates], [high, low])
+
+    def test_extract_douyin_image_candidates_prefers_signed_non_watermark_images(self) -> None:
+        signed = (
+            "https://p3-pc-sign.douyinpic.com/tos-cn-i-0813c000-ce/image-a"
+            "~tplv-dy-aweme-images:q75.webp?biz_tag=aweme_images\\u0026x-signature=abc%3D"
+        )
+        unsigned = (
+            "https://p9-pc-sign.douyinpic.com/tos-cn-i-0813c000-ce/image-a"
+            "~tplv-dy-aweme-images:q75.webp?biz_tag=aweme_images"
+        )
+        watermarked = (
+            "https://p3-pc-sign.douyinpic.com/tos-cn-i-0813c000-ce/image-a"
+            "~tplv-dy-water-v2:mark:1080:1549.webp?biz_tag=aweme_images\\u0026x-signature=water"
+        )
+        comment = (
+            "https://p3-sign.douyinpic.com/tos-cn-i-p14/comment"
+            "~tplv-p14lwwcsbr-1.image?biz_tag=aweme_comment\\u0026x-signature=comment"
+        )
+        html = f'<img src="{signed}"><script>window.x="{unsigned} {watermarked} {comment}"</script>'
+        candidates = dd.extract_douyin_image_candidates_from_text(html)
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("x-signature=abc", candidates[0].url)
+        self.assertNotIn("dy-water", candidates[0].url)
 
 
 if __name__ == "__main__":

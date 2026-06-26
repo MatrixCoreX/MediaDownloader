@@ -119,6 +119,13 @@ class Candidate:
     priority: int
 
 
+@dataclass(frozen=True)
+class ImageCandidate:
+    url: str
+    source: str
+    priority: int
+
+
 def extract_urls(text: str) -> list[str]:
     """Extract HTTP URLs from a copied share message."""
     urls: list[str] = []
@@ -357,10 +364,21 @@ def iter_strings(value: Any) -> Iterable[str]:
             yield from iter_strings(child)
 
 
-def unwrap_url(url: str) -> str:
+def unwrap_url(url: str, *, decode_percent: bool = True) -> str:
     """Decode escaped JSON/HTML URL strings and add a scheme when needed."""
-    current = html.unescape(url).replace("\\u002F", "/").replace("\\/", "/")
-    current = urllib.parse.unquote(current)
+    current = (
+        html.unescape(url)
+        .replace("\\u002F", "/")
+        .replace("\\u002f", "/")
+        .replace("\\u0026", "&")
+        .replace("\\u003D", "=")
+        .replace("\\u003d", "=")
+        .replace("\\u003F", "?")
+        .replace("\\u003f", "?")
+        .replace("\\/", "/")
+    )
+    if decode_percent:
+        current = urllib.parse.unquote(current)
     if current.startswith("//"):
         current = "https:" + current
     return current
@@ -430,6 +448,89 @@ def looks_like_platform_video_url(url: str, platform: str) -> bool:
     if platform == "xiaohongshu":
         return looks_like_xiaohongshu_video_url(url)
     return looks_like_play_url(url) or looks_like_douyin_browser_video_url(url)
+
+
+def looks_like_douyin_image_url(url: str) -> bool:
+    normalized = unwrap_url(url, decode_percent=False)
+    lowered = normalized.lower()
+    if not lowered.startswith(("http://", "https://", "//")):
+        return False
+    parsed = urllib.parse.urlsplit(lowered)
+    if not any(token in parsed.netloc for token in ("douyinpic.com", "byteimg.com")):
+        return False
+    if "biz_tag=aweme_images" not in lowered and "tplv-dy-aweme-images" not in lowered:
+        return False
+    if "tplv-dy-water" in lowered or "water-v" in lowered:
+        return False
+    if "aweme_comment" in lowered or "aweme-avatar" in lowered:
+        return False
+    return True
+
+
+def douyin_image_key(url: str) -> str:
+    parsed = urllib.parse.urlsplit(unwrap_url(url, decode_percent=False))
+    return parsed.path.split("~", 1)[0]
+
+
+def douyin_image_quality_score(url: str) -> int:
+    lowered = unwrap_url(url, decode_percent=False).lower()
+    score = 0
+    if "x-signature=" not in lowered:
+        score += 100
+    if "tplv-dy-aweme-images" not in lowered:
+        score += 50
+    if ".webp" in urllib.parse.urlsplit(lowered).path:
+        score += 0
+    elif ".jpeg" in urllib.parse.urlsplit(lowered).path or ".jpg" in urllib.parse.urlsplit(lowered).path:
+        score += 5
+    else:
+        score += 20
+    return score
+
+
+def add_image_candidate(
+    candidates_by_key: dict[str, ImageCandidate],
+    url: str,
+    source: str,
+    order: int,
+) -> None:
+    normalized = unwrap_url(url, decode_percent=False)
+    if not looks_like_douyin_image_url(normalized):
+        return
+    key = douyin_image_key(normalized)
+    quality = douyin_image_quality_score(normalized)
+    existing = candidates_by_key.get(key)
+    if existing:
+        existing_order = existing.priority // 1000
+        existing_quality = existing.priority % 1000
+        if quality >= existing_quality:
+            return
+        order = existing_order
+    candidates_by_key[key] = ImageCandidate(normalized, source, order * 1000 + quality)
+
+
+def extract_douyin_image_candidates_from_text(page_text: str, source: str = "douyin.html-image") -> list[ImageCandidate]:
+    normalized_text = (
+        html.unescape(page_text)
+        .replace("\\u002F", "/")
+        .replace("\\u002f", "/")
+        .replace("\\u0026", "&")
+        .replace("\\u003D", "=")
+        .replace("\\u003d", "=")
+        .replace("\\u003F", "?")
+        .replace("\\u003f", "?")
+        .replace("\\/", "/")
+    )
+    url_pattern = re.compile(r"https?://[^\"'<>\\\s]+")
+    candidates_by_key: dict[str, ImageCandidate] = {}
+    order = 0
+    for match in url_pattern.finditer(normalized_text):
+        raw_url = match.group(0).rstrip(".,;:!?)]}>\"'，。；：！？）】》、")
+        if not looks_like_douyin_image_url(raw_url):
+            continue
+        add_image_candidate(candidates_by_key, raw_url, source, order)
+        order += 1
+    return sorted(candidates_by_key.values(), key=lambda candidate: candidate.priority)
 
 
 def add_candidate(
@@ -713,7 +814,7 @@ def gather_browser_candidates(
     cookie: str | None = None,
     timeout: float = 12.0,
     chrome_path: str | None = None,
-) -> tuple[str | None, list[Candidate], list[str]]:
+) -> tuple[str | None, list[Candidate], list[ImageCandidate], list[str]]:
     urls = extract_urls(share_text)
     if not urls:
         if share_text.strip().startswith(("http://", "https://")):
@@ -728,12 +829,14 @@ def gather_browser_candidates(
             "Browser fallback skipped: no Chromium-compatible browser was found. "
             "Install Chrome, Chromium, Edge, Brave, or pass --chrome-path."
         )
-        return extract_platform_id(platform, share_text), [], logs
+        return extract_platform_id(platform, share_text), [], [], logs
     if cookie:
         logs.append("Browser fallback uses a fresh local Chrome profile; --cookie only applies to direct HTTP parsing.")
 
     item_id = extract_platform_id(platform, share_text)
     candidates: list[Candidate] = []
+    image_candidates: list[ImageCandidate] = []
+    seen_image_urls: set[str] = set()
     seen: set[str] = set()
     target_urls: list[str] = []
 
@@ -795,6 +898,18 @@ def gather_browser_candidates(
                 logs.append(f"{platform}: browser fallback Chrome exited with {completed.returncode}{detail}")
 
             item_id = item_id or extract_platform_id(platform, target_url, completed.stdout)
+            if platform == "douyin":
+                dom_image_candidates = extract_douyin_image_candidates_from_text(
+                    completed.stdout,
+                    "douyin.browser-dom-image",
+                )
+                logs.append(f"{platform}: browser fallback found {len(dom_image_candidates)} image candidate(s)")
+                for candidate in dom_image_candidates:
+                    if candidate.url in seen_image_urls:
+                        continue
+                    seen_image_urls.add(candidate.url)
+                    image_candidates.append(candidate)
+
             for candidate in extract_platform_candidates_from_html(completed.stdout, platform):
                 add_platform_candidate(
                     candidates,
@@ -818,10 +933,15 @@ def gather_browser_candidates(
             logs.append(f"{platform}: browser fallback found {len(netlog_candidates)} network video candidate(s)")
             for candidate in netlog_candidates:
                 add_platform_candidate(candidates, seen, candidate.url, candidate.source, candidate.priority, platform)
-            if candidates:
+            if candidates or image_candidates:
                 break
 
-    return item_id, sorted(candidates, key=lambda candidate: candidate.priority), logs
+    return (
+        item_id,
+        sorted(candidates, key=lambda candidate: candidate.priority),
+        sorted(image_candidates, key=lambda candidate: candidate.priority),
+        logs,
+    )
 
 
 def detail_api_urls(aweme_id: str) -> list[str]:
@@ -840,7 +960,7 @@ def gather_candidates(
     *,
     cookie: str | None = None,
     timeout: float = 20.0,
-) -> tuple[str | None, list[Candidate], list[str]]:
+) -> tuple[str | None, list[Candidate], list[ImageCandidate], list[str]]:
     """Resolve a share message and gather candidate video URLs."""
     urls = extract_urls(share_text)
     if not urls:
@@ -851,6 +971,8 @@ def gather_candidates(
 
     logs: list[str] = []
     all_candidates: list[Candidate] = []
+    image_candidates: list[ImageCandidate] = []
+    seen_image_urls: set[str] = set()
     seen_candidates: set[str] = set()
     aweme_id = extract_aweme_id(share_text)
 
@@ -863,6 +985,11 @@ def gather_candidates(
 
         for candidate in extract_candidates_from_html(page_text):
             add_candidate(all_candidates, seen_candidates, candidate.url, candidate.source, candidate.priority)
+        for image_candidate in extract_douyin_image_candidates_from_text(page_text):
+            if image_candidate.url in seen_image_urls:
+                continue
+            seen_image_urls.add(image_candidate.url)
+            image_candidates.append(image_candidate)
 
     if aweme_id:
         for api_url in detail_api_urls(aweme_id):
@@ -886,7 +1013,12 @@ def gather_candidates(
             for candidate in extract_candidates_from_json(payload):
                 add_candidate(all_candidates, seen_candidates, candidate.url, candidate.source, candidate.priority)
 
-    return aweme_id, sorted(all_candidates, key=lambda candidate: candidate.priority), logs
+    return (
+        aweme_id,
+        sorted(all_candidates, key=lambda candidate: candidate.priority),
+        sorted(image_candidates, key=lambda candidate: candidate.priority),
+        logs,
+    )
 
 
 def platform_referer(platform: str) -> str:
@@ -911,7 +1043,7 @@ def gather_web_platform_candidates(
     platform: str,
     cookie: str | None = None,
     timeout: float = 20.0,
-) -> tuple[str | None, list[Candidate], list[str]]:
+) -> tuple[str | None, list[Candidate], list[ImageCandidate], list[str]]:
     urls = extract_urls(share_text)
     if not urls:
         if share_text.strip().startswith(("http://", "https://")):
@@ -951,7 +1083,7 @@ def gather_web_platform_candidates(
                 platform,
             )
 
-    return item_id, sorted(all_candidates, key=lambda candidate: candidate.priority), logs
+    return item_id, sorted(all_candidates, key=lambda candidate: candidate.priority), [], logs
 
 
 def gather_candidates_for_request(
@@ -963,7 +1095,7 @@ def gather_candidates_for_request(
     browser_fallback: bool = True,
     browser_timeout: float = 12.0,
     chrome_path: str | None = None,
-) -> tuple[str, str | None, list[Candidate], list[str]]:
+) -> tuple[str, str | None, list[Candidate], list[ImageCandidate], list[str]]:
     resolved_platform = detect_platform(share_text) if platform == "auto" else platform
     if not resolved_platform:
         raise DouyinDownloadError(
@@ -972,10 +1104,10 @@ def gather_candidates_for_request(
         )
 
     if resolved_platform == "douyin":
-        item_id, candidates, logs = gather_candidates(share_text, cookie=cookie, timeout=timeout)
-        if not candidates and browser_fallback:
+        item_id, candidates, image_candidates, logs = gather_candidates(share_text, cookie=cookie, timeout=timeout)
+        if not candidates and not image_candidates and browser_fallback:
             logs.append("douyin: direct extraction found no candidates, trying browser fallback")
-            browser_item_id, browser_candidates, browser_logs = gather_browser_candidates(
+            browser_item_id, browser_candidates, browser_image_candidates, browser_logs = gather_browser_candidates(
                 share_text,
                 platform=resolved_platform,
                 cookie=cookie,
@@ -985,18 +1117,19 @@ def gather_candidates_for_request(
             logs.extend(browser_logs)
             item_id = item_id or browser_item_id
             candidates = browser_candidates
-        return resolved_platform, item_id, candidates, logs
+            image_candidates = browser_image_candidates
+        return resolved_platform, item_id, candidates, image_candidates, logs
 
     if resolved_platform in {"kuaishou", "xiaohongshu"}:
-        item_id, candidates, platform_logs = gather_web_platform_candidates(
+        item_id, candidates, image_candidates, platform_logs = gather_web_platform_candidates(
             share_text,
             platform=resolved_platform,
             cookie=cookie,
             timeout=timeout,
         )
-        if not candidates and browser_fallback:
+        if not candidates and not image_candidates and browser_fallback:
             platform_logs.append(f"{resolved_platform}: direct extraction found no candidates, trying browser fallback")
-            browser_item_id, browser_candidates, browser_logs = gather_browser_candidates(
+            browser_item_id, browser_candidates, browser_image_candidates, browser_logs = gather_browser_candidates(
                 share_text,
                 platform=resolved_platform,
                 cookie=cookie,
@@ -1006,7 +1139,8 @@ def gather_candidates_for_request(
             platform_logs.extend(browser_logs)
             item_id = item_id or browser_item_id
             candidates = browser_candidates
-        return resolved_platform, item_id, candidates, platform_logs
+            image_candidates = browser_image_candidates
+        return resolved_platform, item_id, candidates, image_candidates, platform_logs
 
     raise DouyinDownloadError(f"Unsupported platform: {resolved_platform}")
 
@@ -1028,11 +1162,42 @@ def timestamp_output_name() -> str:
     return f"{time.strftime(OUTPUT_TIME_FORMAT)}.mp4"
 
 
+def timestamp_output_stem() -> str:
+    return time.strftime(OUTPUT_TIME_FORMAT)
+
+
 def content_type_is_video(headers: dict[str, str]) -> bool:
     content_type = headers.get("content-type", "").lower()
     if not content_type:
         return True
     return content_type.startswith("video/") or "octet-stream" in content_type
+
+
+def content_type_is_image(headers: dict[str, str]) -> bool:
+    content_type = headers.get("content-type", "").lower()
+    if not content_type:
+        return True
+    return content_type.startswith("image/") or "octet-stream" in content_type
+
+
+def image_suffix_from_url(url: str) -> str:
+    path = urllib.parse.urlsplit(unwrap_url(url, decode_percent=False)).path.lower()
+    for suffix in (".webp", ".jpg", ".jpeg", ".png", ".avif", ".gif"):
+        if suffix in path:
+            return ".jpg" if suffix == ".jpeg" else suffix
+    return ".jpg"
+
+
+def image_suffix_from_content_type(content_type: str | None, fallback: str) -> str:
+    lowered = (content_type or "").lower().split(";", 1)[0].strip()
+    return {
+        "image/webp": ".webp",
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/avif": ".avif",
+        "image/gif": ".gif",
+    }.get(lowered, fallback)
 
 
 def download_candidate(
@@ -1076,11 +1241,91 @@ def download_candidate(
         raise DouyinDownloadError(f"Network error while downloading {candidate.url}: {exc.reason}") from exc
 
 
+def download_image_candidate(
+    candidate: ImageCandidate,
+    output_path: Path,
+    *,
+    cookie: str | None = None,
+    timeout: float = 30.0,
+    referer: str | None = None,
+) -> Path:
+    headers = build_headers(
+        cookie,
+        {
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": referer or "https://www.douyin.com/",
+        },
+    )
+    request = urllib.request.Request(candidate.url, headers=headers)
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_headers = {k.lower(): v for k, v in response.headers.items()}
+            if not content_type_is_image(response_headers):
+                content_type = response_headers.get("content-type", "unknown")
+                raise DouyinDownloadError(
+                    f"Candidate returned non-image content ({content_type}) from {candidate.source}"
+                )
+
+            suffix = image_suffix_from_content_type(
+                response_headers.get("content-type"),
+                output_path.suffix or image_suffix_from_url(candidate.url),
+            )
+            if output_path.suffix.lower() != suffix:
+                output_path = output_path.with_suffix(suffix)
+            tmp_path = output_path.with_suffix(output_path.suffix + ".part")
+            with tmp_path.open("wb") as fp:
+                while True:
+                    chunk = response.read(1024 * 256)
+                    if not chunk:
+                        break
+                    fp.write(chunk)
+            tmp_path.replace(output_path)
+            return output_path
+    except urllib.error.HTTPError as exc:
+        raise DouyinDownloadError(f"HTTP {exc.code} while downloading image {candidate.url}") from exc
+    except urllib.error.URLError as exc:
+        raise DouyinDownloadError(f"Network error while downloading image {candidate.url}: {exc.reason}") from exc
+
+
+def download_image_candidates(
+    candidates: list[ImageCandidate],
+    output_dir: Path,
+    *,
+    output_name: str | None = None,
+    overwrite: bool = False,
+    cookie: str | None = None,
+    timeout: float = 30.0,
+    referer: str | None = None,
+) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    base_name = Path(output_name).stem if output_name else timestamp_output_stem()
+    saved_paths: list[Path] = []
+    multiple = len(candidates) > 1
+    for index, candidate in enumerate(candidates, start=1):
+        suffix = image_suffix_from_url(candidate.url)
+        filename = f"{base_name}_{index:02d}{suffix}" if multiple else f"{base_name}{suffix}"
+        output_path = output_dir / filename
+        if output_path.exists() and not overwrite:
+            output_path = unique_output_path(output_path)
+        saved_paths.append(
+            download_image_candidate(
+                candidate,
+                output_path,
+                cookie=cookie,
+                timeout=timeout,
+                referer=referer,
+            )
+        )
+    return saved_paths
+
+
 def save_metadata(
     path: Path,
     platform: str,
     item_id: str | None,
     candidates: list[Candidate],
+    image_candidates: list[ImageCandidate] | None,
     logs: list[str],
 ) -> None:
     metadata = {
@@ -1088,6 +1333,7 @@ def save_metadata(
         "item_id": item_id,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "candidates": [candidate.__dict__ for candidate in candidates],
+        "image_candidates": [candidate.__dict__ for candidate in (image_candidates or [])],
         "logs": logs,
     }
     path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1209,7 +1455,7 @@ def read_share_text(args: argparse.Namespace) -> str:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download an accessible Douyin, Kuaishou, or Xiaohongshu video from copied share text.",
+        description="Download accessible Douyin, Kuaishou, or Xiaohongshu media from copied share text.",
     )
     parser.add_argument(
         "share",
@@ -1280,7 +1526,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--print-url",
         action="store_true",
-        help="Print the best extracted video URL without downloading.",
+        help="Print the best extracted media URL without downloading.",
     )
     parser.add_argument(
         "--save-meta",
@@ -1342,7 +1588,7 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
     if not share_text.strip():
         raise DouyinDownloadError("No share text was provided.")
 
-    platform, item_id, candidates, logs = gather_candidates_for_request(
+    platform, item_id, candidates, image_candidates, logs = gather_candidates_for_request(
         share_text,
         platform=args.platform,
         cookie=cookie,
@@ -1361,8 +1607,13 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
                 f"Candidate {index}: priority={candidate.priority} source={candidate.source} {candidate.url}",
                 file=sys.stderr,
             )
+        for index, candidate in enumerate(image_candidates, start=1):
+            print(
+                f"Image candidate {index}: priority={candidate.priority} source={candidate.source} {candidate.url}",
+                file=sys.stderr,
+            )
 
-    if not candidates:
+    if not candidates and not image_candidates:
         message = (
             "No downloadable video URL was found. The post may be private, unavailable, "
             "or the platform may require a browser cookie for this page."
@@ -1375,10 +1626,38 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
             )
         raise DouyinDownloadError(message)
 
-    best = candidates[0]
     if args.print_url:
-        print(best.url)
+        if candidates:
+            print(candidates[0].url)
+        else:
+            for candidate in image_candidates:
+                print(candidate.url)
         return 0
+
+    if image_candidates and not candidates:
+        output_dir = Path(args.output_dir).expanduser()
+        image_output_name = args.output_name or timestamp_output_stem()
+        saved_paths = download_image_candidates(
+            image_candidates,
+            output_dir,
+            output_name=image_output_name,
+            overwrite=args.overwrite,
+            cookie=cookie,
+            timeout=args.timeout,
+            referer=platform_referer(platform),
+        )
+        if args.save_meta:
+            meta_name = f"{Path(image_output_name).stem}.json"
+            save_metadata(output_dir / meta_name, platform, item_id, [], image_candidates, logs)
+        for path in saved_paths:
+            if args.show_info:
+                print(f"file: {path}")
+                print(f"size: {path.stat().st_size / 1024 / 1024:.2f} MiB ({path.stat().st_size} bytes)")
+            else:
+                print(path)
+        return 0
+
+    best = candidates[0]
 
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1401,7 +1680,7 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
                 referer=platform_referer(platform),
             )
             if args.save_meta:
-                save_metadata(saved_path.with_suffix(".json"), platform, item_id, candidates, logs)
+                save_metadata(saved_path.with_suffix(".json"), platform, item_id, candidates, image_candidates, logs)
             if args.show_info:
                 print_media_info(saved_path)
             else:
