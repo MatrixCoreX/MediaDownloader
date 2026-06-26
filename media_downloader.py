@@ -437,9 +437,16 @@ def looks_like_xiaohongshu_video_url(url: str) -> bool:
     lowered = unwrap_url(url).lower()
     if not lowered.startswith(("http://", "https://", "//")):
         return False
-    if not any(token in lowered for token in ("xiaohongshu", "xhscdn", "sns-video", "redcdn", "xhs")):
+    parsed = urllib.parse.urlsplit(lowered)
+    host = parsed.netloc
+    path = parsed.path
+    if not path or path == "/":
         return False
-    return any(token in lowered for token in (".mp4", "video", "stream"))
+    if path.endswith((".ico", ".json", ".pdf", ".js", ".css", ".png", ".jpg", ".jpeg", ".webp", ".svg")):
+        return False
+    if "sns-video" in host or "redcdn" in host:
+        return ".mp4" in path or "stream" in path or "video" in path
+    return ".mp4" in path and any(token in host for token in ("xiaohongshu", "xhscdn", "xhs"))
 
 
 def looks_like_platform_video_url(url: str, platform: str) -> bool:
@@ -467,6 +474,31 @@ def looks_like_douyin_image_url(url: str) -> bool:
     return True
 
 
+def looks_like_xiaohongshu_image_url(url: str) -> bool:
+    normalized = unwrap_url(url, decode_percent=False)
+    lowered = normalized.lower()
+    if not lowered.startswith(("http://", "https://", "//")):
+        return False
+    parsed = urllib.parse.urlsplit(lowered)
+    host = parsed.netloc
+    path = parsed.path
+    if not path or path == "/":
+        return False
+    if "xhscdn.com" not in host and "xhscdn.net" not in host and "xiaohongshu.com" not in host:
+        return False
+    if not any(token in host for token in ("sns-webpic", "sns-img", "ci.xiaohongshu", "sns-avatar")):
+        return False
+    if "sns-avatar" in host or "/avatar/" in path:
+        return False
+    if "sns-webpic" not in host and "sns-img" not in host and "ci.xiaohongshu" not in host:
+        return False
+    if "fe-video" in host or "sns-video" in host:
+        return False
+    if path.endswith((".ico", ".json", ".pdf", ".js", ".css", ".svg")):
+        return False
+    return True
+
+
 def douyin_image_key(url: str) -> str:
     parsed = urllib.parse.urlsplit(unwrap_url(url, decode_percent=False))
     return parsed.path.split("~", 1)[0]
@@ -486,6 +518,25 @@ def douyin_image_quality_score(url: str) -> int:
     else:
         score += 20
     return score
+
+
+def xiaohongshu_image_key(url: str) -> str:
+    parsed = urllib.parse.urlsplit(unwrap_url(url, decode_percent=False))
+    filename = parsed.path.rsplit("/", 1)[-1]
+    if filename:
+        return filename.split("!", 1)[0]
+    return parsed.path
+
+
+def xiaohongshu_image_quality_score(url: str) -> int:
+    lowered = unwrap_url(url, decode_percent=False).lower()
+    if "nd_dft" in lowered or "dft" in lowered:
+        return 0
+    if "nd_wm" in lowered or "watermark" in lowered:
+        return 80
+    if "nd_prv" in lowered or "prv" in lowered:
+        return 100
+    return 50
 
 
 def add_image_candidate(
@@ -509,8 +560,29 @@ def add_image_candidate(
     candidates_by_key[key] = ImageCandidate(normalized, source, order * 1000 + quality)
 
 
-def extract_douyin_image_candidates_from_text(page_text: str, source: str = "douyin.html-image") -> list[ImageCandidate]:
-    normalized_text = (
+def add_xiaohongshu_image_candidate(
+    candidates_by_key: dict[str, ImageCandidate],
+    url: str,
+    source: str,
+    order: int,
+) -> None:
+    normalized = unwrap_url(url, decode_percent=False)
+    if not looks_like_xiaohongshu_image_url(normalized):
+        return
+    key = xiaohongshu_image_key(normalized)
+    quality = xiaohongshu_image_quality_score(normalized)
+    existing = candidates_by_key.get(key)
+    if existing:
+        existing_order = existing.priority // 1000
+        existing_quality = existing.priority % 1000
+        if quality >= existing_quality:
+            return
+        order = existing_order
+    candidates_by_key[key] = ImageCandidate(normalized, source, order * 1000 + quality)
+
+
+def normalize_embedded_url_text(page_text: str) -> str:
+    return (
         html.unescape(page_text)
         .replace("\\u002F", "/")
         .replace("\\u002f", "/")
@@ -521,6 +593,10 @@ def extract_douyin_image_candidates_from_text(page_text: str, source: str = "dou
         .replace("\\u003f", "?")
         .replace("\\/", "/")
     )
+
+
+def extract_douyin_image_candidates_from_text(page_text: str, source: str = "douyin.html-image") -> list[ImageCandidate]:
+    normalized_text = normalize_embedded_url_text(page_text)
     url_pattern = re.compile(r"https?://[^\"'<>\\\s]+")
     candidates_by_key: dict[str, ImageCandidate] = {}
     order = 0
@@ -529,6 +605,23 @@ def extract_douyin_image_candidates_from_text(page_text: str, source: str = "dou
         if not looks_like_douyin_image_url(raw_url):
             continue
         add_image_candidate(candidates_by_key, raw_url, source, order)
+        order += 1
+    return sorted(candidates_by_key.values(), key=lambda candidate: candidate.priority)
+
+
+def extract_xiaohongshu_image_candidates_from_text(
+    page_text: str,
+    source: str = "xiaohongshu.html-image",
+) -> list[ImageCandidate]:
+    normalized_text = normalize_embedded_url_text(page_text)
+    url_pattern = re.compile(r"https?://[^\"'<>\\\s]+")
+    candidates_by_key: dict[str, ImageCandidate] = {}
+    order = 0
+    for match in url_pattern.finditer(normalized_text):
+        raw_url = match.group(0).rstrip(".,;:!?)]}>\"'，。；：！？）】》、")
+        if not looks_like_xiaohongshu_image_url(raw_url):
+            continue
+        add_xiaohongshu_image_candidate(candidates_by_key, raw_url, source, order)
         order += 1
     return sorted(candidates_by_key.values(), key=lambda candidate: candidate.priority)
 
@@ -898,10 +991,15 @@ def gather_browser_candidates(
                 logs.append(f"{platform}: browser fallback Chrome exited with {completed.returncode}{detail}")
 
             item_id = item_id or extract_platform_id(platform, target_url, completed.stdout)
-            if platform == "douyin":
-                dom_image_candidates = extract_douyin_image_candidates_from_text(
+            if platform in {"douyin", "xiaohongshu"}:
+                image_extractor = (
+                    extract_douyin_image_candidates_from_text
+                    if platform == "douyin"
+                    else extract_xiaohongshu_image_candidates_from_text
+                )
+                dom_image_candidates = image_extractor(
                     completed.stdout,
-                    "douyin.browser-dom-image",
+                    f"{platform}.browser-dom-image",
                 )
                 logs.append(f"{platform}: browser fallback found {len(dom_image_candidates)} image candidate(s)")
                 for candidate in dom_image_candidates:
@@ -1053,6 +1151,8 @@ def gather_web_platform_candidates(
 
     logs: list[str] = []
     all_candidates: list[Candidate] = []
+    image_candidates: list[ImageCandidate] = []
+    seen_image_urls: set[str] = set()
     seen_candidates: set[str] = set()
     item_id = extract_platform_id(platform, share_text)
     headers = {
@@ -1082,8 +1182,19 @@ def gather_web_platform_candidates(
                 candidate.priority,
                 platform,
             )
+        if platform == "xiaohongshu":
+            for image_candidate in extract_xiaohongshu_image_candidates_from_text(page_text):
+                if image_candidate.url in seen_image_urls:
+                    continue
+                seen_image_urls.add(image_candidate.url)
+                image_candidates.append(image_candidate)
 
-    return item_id, sorted(all_candidates, key=lambda candidate: candidate.priority), [], logs
+    return (
+        item_id,
+        sorted(all_candidates, key=lambda candidate: candidate.priority),
+        sorted(image_candidates, key=lambda candidate: candidate.priority),
+        logs,
+    )
 
 
 def gather_candidates_for_request(

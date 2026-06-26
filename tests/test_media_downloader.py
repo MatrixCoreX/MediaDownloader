@@ -50,6 +50,11 @@ class DouyinDownloaderTests(unittest.TestCase):
         candidates = dd.extract_xiaohongshu_candidates_from_json(payload)
         self.assertEqual(candidates[0].url, "https://sns-video-hw.xhscdn.com/stream/abc")
 
+    def test_xiaohongshu_video_detection_rejects_static_assets(self) -> None:
+        self.assertFalse(dd.looks_like_xiaohongshu_video_url("https://fe-video-qc.xhscdn.com/fe-platform/icon.ico"))
+        self.assertFalse(dd.looks_like_xiaohongshu_video_url("https://sns-video-qc.xhscdn.com"))
+        self.assertTrue(dd.looks_like_xiaohongshu_video_url("https://sns-video-hw.xhscdn.com/stream/abc.mp4"))
+
     def test_extract_json_from_state_script(self) -> None:
         html = '<script>window.__INITIAL_STATE__={"video":{"url":"https://sns-video-hw.xhscdn.com/stream/abc"}};</script>'
         payloads = dd.extract_json_from_html(html)
@@ -148,6 +153,22 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertIn("x-signature=abc", candidates[0].url)
         self.assertNotIn("dy-water", candidates[0].url)
+
+    def test_extract_xiaohongshu_image_candidates_prefers_default_image(self) -> None:
+        preview = (
+            "http:\\u002F\\u002Fsns-webpic-qc.xhscdn.com\\u002F202606260823\\u002Fpreview-hash"
+            "\\u002Fimage-file!nd_prv_wlteh_jpg_3"
+        )
+        default = (
+            "http:\\u002F\\u002Fsns-webpic-qc.xhscdn.com\\u002F202606260823\\u002Fdefault-hash"
+            "\\u002Fimage-file!nd_dft_wlteh_jpg_3"
+        )
+        avatar = "https:\\u002F\\u002Fsns-avatar-qc.xhscdn.com\\u002Favatar\\u002Fimage-file"
+        html = f'<script>window.__INITIAL_STATE__={{"imageList":[{{"urlPre":"{preview}","urlDefault":"{default}","avatar":"{avatar}"}}]}}</script>'
+        candidates = dd.extract_xiaohongshu_image_candidates_from_text(html)
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("nd_dft", candidates[0].url)
+        self.assertNotIn("sns-avatar", candidates[0].url)
 
 
 if __name__ == "__main__":
