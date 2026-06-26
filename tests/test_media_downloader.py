@@ -115,6 +115,22 @@ class DouyinDownloaderTests(unittest.TestCase):
                 self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
         self.assertIn("detected_media: video", stderr.getvalue())
 
+    def test_handle_share_text_prints_kuaishou_video_media_type(self) -> None:
+        args = dd.parse_args(["--print-url", "https://v.kuaishou.com/abc123"])
+        candidate = dd.Candidate("https://txmov2.a.kwimgs.com/upic/abc.mp4", "test", 1)
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("kuaishou", "abc123", [candidate], [], []),
+        ):
+            with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+        message = stderr.getvalue()
+        self.assertIn("detected_media: video", message)
+        self.assertIn("platform=kuaishou", message)
+
     def test_handle_share_text_prints_image_media_type(self) -> None:
         args = dd.parse_args(["--print-url", "https://www.xiaohongshu.com/discovery/item/abc"])
         image_candidate = dd.ImageCandidate("https://example.com/image.jpg", "test", 1)
