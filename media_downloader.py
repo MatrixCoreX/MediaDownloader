@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import http.cookiejar
 import json
 import re
 import shutil
@@ -65,6 +66,12 @@ XIAOHONGSHU_ID_PATTERNS = (
     re.compile(r"[?&](?:note_id|noteId|item_id)=([^&#]+)"),
     re.compile(r'"(?:noteId|note_id|itemId|item_id)"\s*:\s*"([^"]+)"'),
 )
+TIKTOK_ID_PATTERNS = (
+    re.compile(r"/@[^/?#]+/video/(\d{10,})"),
+    re.compile(r"/video/(\d{10,})"),
+    re.compile(r"[?&](?:item_id|itemId|video_id|videoId)=(\d{10,})"),
+    re.compile(r'"(?:id|itemId|item_id|videoId|video_id)"\s*:\s*"?(\d{10,})"?'),
+)
 JS_STATE_MARKERS = (
     "__INITIAL_STATE__",
     "__APOLLO_STATE__",
@@ -72,11 +79,16 @@ JS_STATE_MARKERS = (
     "__NUXT__",
     "__INITIAL_DATA__",
     "__INITIAL_DATA_FOR_REHYDRATION__",
+    "__UNIVERSAL_DATA_FOR_REHYDRATION__",
+    "SIGI_STATE",
 )
 DOUYIN_DOMAINS = ("douyin.com", "iesdouyin.com")
 KUAISHOU_DOMAINS = ("kuaishou.com", "gifshow.com", "ksurl.cn", "kwai.com", "v.kuaishou.com")
 XIAOHONGSHU_DOMAINS = ("xiaohongshu.com", "xhslink.com", "xhscdn.com", "xhs.cn")
-PLATFORMS = ("auto", "douyin", "kuaishou", "xiaohongshu")
+TIKTOK_DOMAINS = ("tiktok.com", "tiktokv.com", "tiktokcdn.com", "vm.tiktok.com", "vt.tiktok.com")
+PLATFORMS = ("auto", "douyin", "kuaishou", "xiaohongshu", "tiktok")
+PLATFORM_ALIASES = {"titok": "tiktok"}
+PLATFORM_CHOICES = PLATFORMS + tuple(PLATFORM_ALIASES)
 OUTPUT_TIME_FORMAT = "%Y%m%d_%H%M%S"
 CHROMIUM_BROWSER_EXECUTABLES = (
     "google-chrome",
@@ -117,6 +129,8 @@ class Candidate:
     url: str
     source: str
     priority: int
+    cookie: str | None = None
+    referer: str | None = None
 
 
 @dataclass(frozen=True)
@@ -173,12 +187,30 @@ def extract_xiaohongshu_id(*parts: str) -> str | None:
     return None
 
 
+def extract_tiktok_id(*parts: str) -> str | None:
+    for part in parts:
+        if not part:
+            continue
+        decoded = urllib.parse.unquote(html.unescape(part))
+        for pattern in TIKTOK_ID_PATTERNS:
+            match = pattern.search(decoded)
+            if match:
+                return match.group(1)
+    return None
+
+
+def normalize_platform(platform: str) -> str:
+    return PLATFORM_ALIASES.get(platform, platform)
+
+
 def detect_platform(text: str) -> str | None:
     lowered = text.lower()
     if any(domain in lowered for domain in KUAISHOU_DOMAINS):
         return "kuaishou"
     if any(domain in lowered for domain in XIAOHONGSHU_DOMAINS):
         return "xiaohongshu"
+    if any(domain in lowered for domain in TIKTOK_DOMAINS):
+        return "tiktok"
     if any(domain in lowered for domain in DOUYIN_DOMAINS):
         return "douyin"
     return None
@@ -201,6 +233,15 @@ def build_headers(cookie: str | None = None, extra: dict[str, str] | None = None
     if extra:
         headers.update(extra)
     return headers
+
+
+def combine_cookie_headers(*cookies: str | None) -> str | None:
+    parts = [cookie.strip().rstrip(";") for cookie in cookies if cookie and cookie.strip()]
+    return "; ".join(parts) if parts else None
+
+
+def cookie_header_from_jar(cookie_jar: http.cookiejar.CookieJar) -> str | None:
+    return combine_cookie_headers(*[f"{cookie.name}={cookie.value}" for cookie in cookie_jar])
 
 
 def http_get(
@@ -226,6 +267,39 @@ def http_get(
                 content=content,
                 headers={k.lower(): v for k, v in response.headers.items()},
             )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(512).decode("utf-8", errors="replace")
+        raise DouyinDownloadError(f"HTTP {exc.code} for {url}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise DouyinDownloadError(f"Network error for {url}: {exc.reason}") from exc
+
+
+def http_get_with_session_cookies(
+    url: str,
+    *,
+    cookie: str | None = None,
+    timeout: float = 20.0,
+    max_bytes: int | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> tuple[FetchResult, str | None]:
+    """Fetch a page and return cookies set during that same request."""
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
+    headers = build_headers(cookie, extra_headers)
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            if max_bytes is None:
+                content = response.read()
+            else:
+                content = response.read(max_bytes + 1)
+            result = FetchResult(
+                url=response.geturl(),
+                status=response.status,
+                content=content,
+                headers={k.lower(): v for k, v in response.headers.items()},
+            )
+            return result, combine_cookie_headers(cookie, cookie_header_from_jar(cookie_jar))
     except urllib.error.HTTPError as exc:
         detail = exc.read(512).decode("utf-8", errors="replace")
         raise DouyinDownloadError(f"HTTP {exc.code} for {url}: {detail}") from exc
@@ -449,11 +523,39 @@ def looks_like_xiaohongshu_video_url(url: str) -> bool:
     return ".mp4" in path and any(token in host for token in ("xiaohongshu", "xhscdn", "xhs"))
 
 
+def looks_like_tiktok_video_url(url: str) -> bool:
+    lowered = unwrap_url(url).lower()
+    if not lowered.startswith(("http://", "https://", "//")):
+        return False
+    parsed = urllib.parse.urlsplit(lowered)
+    host = parsed.netloc
+    path = parsed.path
+    query = parsed.query
+    if not path or path == "/":
+        return False
+    if path.endswith((".ico", ".json", ".pdf", ".js", ".css", ".png", ".jpg", ".jpeg", ".webp", ".svg")):
+        return False
+    if "tiktok.com" in host and "/@" in path and "/video/" in path:
+        return False
+
+    cdn_host = (
+        any(token in host for token in ("tiktokcdn", "tiktokv", "byteoversea", "muscdn", "snssdk", "akamaized"))
+        or (host.startswith(("v16", "v19", "v26")) and "tiktok" in host)
+        or ("tiktok.com" in host and "/video/tos/" in path)
+    )
+    if not cdn_host:
+        return False
+    return ".mp4" in path or "mime_type=video" in query or "/video/tos/" in path
+
+
 def looks_like_platform_video_url(url: str, platform: str) -> bool:
+    platform = normalize_platform(platform)
     if platform == "kuaishou":
         return looks_like_kuaishou_video_url(url)
     if platform == "xiaohongshu":
         return looks_like_xiaohongshu_video_url(url)
+    if platform == "tiktok":
+        return looks_like_tiktok_video_url(url)
     return looks_like_play_url(url) or looks_like_douyin_browser_video_url(url)
 
 
@@ -632,6 +734,9 @@ def add_candidate(
     url: str,
     source: str,
     priority: int,
+    *,
+    cookie: str | None = None,
+    referer: str | None = None,
 ) -> None:
     normalized = prefer_no_watermark_url(url)
     if not looks_like_play_url(normalized):
@@ -639,7 +744,7 @@ def add_candidate(
     if normalized in seen:
         return
     seen.add(normalized)
-    candidates.append(Candidate(normalized, source, priority))
+    candidates.append(Candidate(normalized, source, priority, cookie, referer))
 
 
 def add_platform_candidate(
@@ -649,6 +754,9 @@ def add_platform_candidate(
     source: str,
     priority: int,
     platform: str,
+    *,
+    cookie: str | None = None,
+    referer: str | None = None,
 ) -> None:
     normalized = unwrap_url(url)
     if not looks_like_platform_video_url(normalized, platform):
@@ -656,7 +764,7 @@ def add_platform_candidate(
     if normalized in seen:
         return
     seen.add(normalized)
-    candidates.append(Candidate(normalized, source, priority))
+    candidates.append(Candidate(normalized, source, priority, cookie, referer))
 
 
 def extract_candidates_from_json(value: Any) -> list[Candidate]:
@@ -725,10 +833,23 @@ def add_urls_from_value(
         for index, child in enumerate(value):
             add_urls_from_value(candidates, seen, child, f"{source}[{index}]", priority + index, platform)
     elif isinstance(value, dict):
-        for key in ("url", "masterUrl", "backupUrl", "playUrl", "videoUrl", "src"):
+        for key in (
+            "url",
+            "Url",
+            "masterUrl",
+            "backupUrl",
+            "playUrl",
+            "videoUrl",
+            "src",
+            "playAddr",
+            "playAddrH264",
+            "downloadAddr",
+            "PlayAddr",
+            "DownloadAddr",
+        ):
             if key in value:
                 add_urls_from_value(candidates, seen, value[key], f"{source}.{key}", priority, platform)
-        for key in ("urls", "urlList", "backupUrls", "mainMvUrls"):
+        for key in ("urls", "urlList", "UrlList", "url_list", "backupUrls", "mainMvUrls"):
             if key in value:
                 add_urls_from_value(candidates, seen, value[key], f"{source}.{key}", priority + 5, platform)
 
@@ -798,13 +919,56 @@ def extract_xiaohongshu_candidates_from_json(value: Any) -> list[Candidate]:
     return sorted(candidates, key=lambda candidate: candidate.priority)
 
 
+def extract_tiktok_candidates_from_json(value: Any) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    seen: set[str] = set()
+
+    for item in iter_dicts(value):
+        bitrate_info = item.get("bitrateInfo")
+        if isinstance(bitrate_info, list):
+            for index, bitrate_item in enumerate(bitrate_info):
+                add_urls_from_value(
+                    candidates,
+                    seen,
+                    bitrate_item,
+                    f"tiktok.bitrateInfo[{index}]",
+                    5 + index,
+                    "tiktok",
+                )
+
+        for key, priority in (
+            ("playAddr", 10),
+            ("playAddrH264", 12),
+            ("PlayAddr", 12),
+            ("downloadAddr", 30),
+            ("DownloadAddr", 30),
+            ("UrlList", 15),
+            ("urlList", 15),
+            ("url_list", 15),
+            ("urls", 20),
+            ("url", 90),
+            ("src", 90),
+        ):
+            if key in item:
+                add_urls_from_value(candidates, seen, item[key], f"tiktok.{key}", priority, "tiktok")
+
+    for raw_url in iter_strings(value):
+        if looks_like_tiktok_video_url(raw_url):
+            add_platform_candidate(candidates, seen, raw_url, "tiktok.json-string", 120, "tiktok")
+
+    return sorted(candidates, key=lambda candidate: candidate.priority)
+
+
 def extract_platform_candidates_from_html(page_text: str, platform: str) -> list[Candidate]:
+    platform = normalize_platform(platform)
     candidates: list[Candidate] = []
     seen: set[str] = set()
     if platform == "kuaishou":
         extractor = extract_kuaishou_candidates_from_json
     elif platform == "xiaohongshu":
         extractor = extract_xiaohongshu_candidates_from_json
+    elif platform == "tiktok":
+        extractor = extract_tiktok_candidates_from_json
     else:
         extractor = extract_candidates_from_json
 
@@ -870,6 +1034,7 @@ def iter_netlog_urls(payload: Any) -> Iterable[str]:
 
 
 def browser_candidate_priority(url: str, platform: str, index: int) -> int:
+    platform = normalize_platform(platform)
     if platform == "douyin":
         parsed = urllib.parse.urlsplit(unwrap_url(url))
         query = urllib.parse.parse_qs(parsed.query)
@@ -885,6 +1050,7 @@ def browser_candidate_priority(url: str, platform: str, index: int) -> int:
 
 
 def extract_browser_candidates_from_netlog_payload(payload: Any, platform: str) -> list[Candidate]:
+    platform = normalize_platform(platform)
     candidates: list[Candidate] = []
     seen: set[str] = set()
     for index, raw_url in enumerate(iter_netlog_urls(payload)):
@@ -908,6 +1074,7 @@ def gather_browser_candidates(
     timeout: float = 12.0,
     chrome_path: str | None = None,
 ) -> tuple[str | None, list[Candidate], list[ImageCandidate], list[str]]:
+    platform = normalize_platform(platform)
     urls = extract_urls(share_text)
     if not urls:
         if share_text.strip().startswith(("http://", "https://")):
@@ -1120,18 +1287,23 @@ def gather_candidates(
 
 
 def platform_referer(platform: str) -> str:
+    platform = normalize_platform(platform)
     return {
         "douyin": "https://www.douyin.com/",
         "kuaishou": "https://www.kuaishou.com/",
         "xiaohongshu": "https://www.xiaohongshu.com/",
+        "tiktok": "https://www.tiktok.com/",
     }.get(platform, "https://www.douyin.com/")
 
 
 def extract_platform_id(platform: str, *parts: str) -> str | None:
+    platform = normalize_platform(platform)
     if platform == "kuaishou":
         return extract_kuaishou_id(*parts)
     if platform == "xiaohongshu":
         return extract_xiaohongshu_id(*parts)
+    if platform == "tiktok":
+        return extract_tiktok_id(*parts)
     return extract_aweme_id(*parts)
 
 
@@ -1142,6 +1314,7 @@ def gather_web_platform_candidates(
     cookie: str | None = None,
     timeout: float = 20.0,
 ) -> tuple[str | None, list[Candidate], list[ImageCandidate], list[str]]:
+    platform = normalize_platform(platform)
     urls = extract_urls(share_text)
     if not urls:
         if share_text.strip().startswith(("http://", "https://")):
@@ -1162,13 +1335,23 @@ def gather_web_platform_candidates(
 
     for share_url in urls:
         logs.append(f"{platform}: resolving {share_url}")
-        resolved = http_get(
-            share_url,
-            cookie=cookie,
-            timeout=timeout,
-            max_bytes=6 * 1024 * 1024,
-            extra_headers=headers,
-        )
+        if platform == "tiktok":
+            resolved, session_cookie = http_get_with_session_cookies(
+                share_url,
+                cookie=cookie,
+                timeout=timeout,
+                max_bytes=6 * 1024 * 1024,
+                extra_headers=headers,
+            )
+        else:
+            resolved = http_get(
+                share_url,
+                cookie=cookie,
+                timeout=timeout,
+                max_bytes=6 * 1024 * 1024,
+                extra_headers=headers,
+            )
+            session_cookie = None
         page_text = decode_text(resolved.content, resolved.headers)
         logs.append(f"{platform}: final URL: {resolved.url}")
         item_id = item_id or extract_platform_id(platform, resolved.url, page_text)
@@ -1181,6 +1364,8 @@ def gather_web_platform_candidates(
                 candidate.source,
                 candidate.priority,
                 platform,
+                cookie=session_cookie if platform == "tiktok" else candidate.cookie,
+                referer=resolved.url if platform == "tiktok" else candidate.referer,
             )
         if platform == "xiaohongshu":
             for image_candidate in extract_xiaohongshu_image_candidates_from_text(page_text):
@@ -1207,11 +1392,12 @@ def gather_candidates_for_request(
     browser_timeout: float = 12.0,
     chrome_path: str | None = None,
 ) -> tuple[str, str | None, list[Candidate], list[ImageCandidate], list[str]]:
+    platform = normalize_platform(platform)
     resolved_platform = detect_platform(share_text) if platform == "auto" else platform
     if not resolved_platform:
         raise DouyinDownloadError(
             "Cannot detect platform from the share text. Pass --platform douyin, "
-            "--platform kuaishou, or --platform xiaohongshu."
+            "--platform kuaishou, --platform xiaohongshu, or --platform tiktok."
         )
 
     if resolved_platform == "douyin":
@@ -1231,7 +1417,7 @@ def gather_candidates_for_request(
             image_candidates = browser_image_candidates
         return resolved_platform, item_id, candidates, image_candidates, logs
 
-    if resolved_platform in {"kuaishou", "xiaohongshu"}:
+    if resolved_platform in {"kuaishou", "xiaohongshu", "tiktok"}:
         item_id, candidates, image_candidates, platform_logs = gather_web_platform_candidates(
             share_text,
             platform=resolved_platform,
@@ -1319,11 +1505,13 @@ def download_candidate(
     timeout: float = 30.0,
     referer: str | None = None,
 ) -> Path:
+    effective_cookie = candidate.cookie or cookie
+    effective_referer = candidate.referer or referer or "https://www.douyin.com/"
     headers = build_headers(
-        cookie,
+        effective_cookie,
         {
             "Accept": "*/*",
-            "Referer": referer or "https://www.douyin.com/",
+            "Referer": effective_referer,
         },
     )
     request = urllib.request.Request(candidate.url, headers=headers)
@@ -1431,6 +1619,14 @@ def download_image_candidates(
     return saved_paths
 
 
+def candidate_metadata(candidate: Candidate) -> dict[str, Any]:
+    return {
+        "url": candidate.url,
+        "source": candidate.source,
+        "priority": candidate.priority,
+    }
+
+
 def save_metadata(
     path: Path,
     platform: str,
@@ -1443,7 +1639,7 @@ def save_metadata(
         "platform": platform,
         "item_id": item_id,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "candidates": [candidate.__dict__ for candidate in candidates],
+        "candidates": [candidate_metadata(candidate) for candidate in candidates],
         "image_candidates": [candidate.__dict__ for candidate in (image_candidates or [])],
         "logs": logs,
     }
@@ -1574,7 +1770,7 @@ def media_type_message(platform: str, candidates: list[Candidate], image_candida
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download accessible Douyin, Kuaishou, or Xiaohongshu media from copied share text.",
+        description="Download accessible Douyin, Kuaishou, Xiaohongshu, or TikTok media from copied share text.",
     )
     parser.add_argument(
         "share",
@@ -1608,7 +1804,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--platform",
-        choices=PLATFORMS,
+        choices=PLATFORM_CHOICES,
         default="auto",
         help="Platform to parse. Default: auto",
     )
@@ -1822,7 +2018,7 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
 
 def interactive_loop(args: argparse.Namespace, cookie: str | None) -> int:
     print("Media Downloader interactive mode")
-    print("Paste Douyin/Kuaishou/Xiaohongshu share text or URL, then press Enter. Type exit/quit/q to leave.")
+    print("Paste Douyin/Kuaishou/Xiaohongshu/TikTok share text or URL, then press Enter. Type exit/quit/q to leave.")
     while True:
         try:
             share_text = input("media> ").strip()

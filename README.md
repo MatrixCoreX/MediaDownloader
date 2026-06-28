@@ -1,6 +1,6 @@
 # Media Downloader
 
-命令行媒体下载工具：粘贴抖音、快手或小红书分享文案/链接，自动识别平台和媒体类型，然后下载可访问的原始媒体。
+命令行媒体下载工具：粘贴抖音、快手、小红书或 TikTok 分享文案/链接，自动识别平台和媒体类型，然后下载可访问的原始媒体。
 
 主程序文件名是 `media_downloader.py`。
 
@@ -9,6 +9,7 @@
 - `douyin`: 抖音公开视频、公开图文作品图片。
 - `kuaishou`: 快手公开视频。
 - `xiaohongshu`: 小红书视频笔记、公开图文作品图片。
+- `tiktok`: TikTok 公开视频。
 
 默认平台模式是 `--platform auto`，会根据分享链接自动识别平台。所有平台都只使用直连解析，不调用第三方解析网站。
 
@@ -21,6 +22,7 @@
 ```text
 detected_media: video (platform=douyin, candidates=5)
 detected_media: video (platform=kuaishou, candidates=1)
+detected_media: video (platform=tiktok, candidates=1)
 detected_media: images (platform=xiaohongshu, count=1)
 ```
 
@@ -68,6 +70,7 @@ python3 media_downloader.py --interactive
 python3 media_downloader.py --platform douyin "抖音分享文案或链接"
 python3 media_downloader.py --platform kuaishou "快手分享文案或链接"
 python3 media_downloader.py --platform xiaohongshu "小红书分享文案或链接"
+python3 media_downloader.py --platform tiktok "TikTok 分享文案或链接"
 ```
 
 只打印解析出的媒体地址，不下载：
@@ -165,6 +168,8 @@ python3 media_downloader.py --cookie cookies.txt "https://v.douyin.com/xxxx/"
 `--cookie` 可以传原始 Cookie 字符串，也可以传保存 Cookie 的文本文件路径。
 
 浏览器 fallback 当前使用临时浏览器配置，不会自动读取你日常 Chrome 的登录状态。
+
+解析 TikTok 公开页时，脚本会自动把页面响应下发的临时 cookie 延续到同次视频下载请求；这些临时 cookie 不会写入 metadata。
 
 ## 依赖
 

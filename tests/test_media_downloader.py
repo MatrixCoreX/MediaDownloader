@@ -1,6 +1,8 @@
 import io
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import media_downloader as dd
@@ -19,6 +21,18 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertEqual(dd.detect_platform("https://v.douyin.com/abc123/"), "douyin")
         self.assertEqual(dd.detect_platform("https://v.kuaishou.com/abc123"), "kuaishou")
         self.assertEqual(dd.detect_platform("https://xhslink.com/a/abc123"), "xiaohongshu")
+        self.assertEqual(
+            dd.detect_platform("https://www.tiktok.com/@li_viaris/video/7654516637915188498"),
+            "tiktok",
+        )
+
+    def test_extract_tiktok_id(self) -> None:
+        self.assertEqual(
+            dd.extract_tiktok_id(
+                "https://www.tiktok.com/@li_viaris/video/7654516637915188498?is_from_webapp=1"
+            ),
+            "7654516637915188498",
+        )
 
     def test_extract_kuaishou_candidates_from_json(self) -> None:
         payload = {
@@ -55,6 +69,42 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertFalse(dd.looks_like_xiaohongshu_video_url("https://fe-video-qc.xhscdn.com/fe-platform/icon.ico"))
         self.assertFalse(dd.looks_like_xiaohongshu_video_url("https://sns-video-qc.xhscdn.com"))
         self.assertTrue(dd.looks_like_xiaohongshu_video_url("https://sns-video-hw.xhscdn.com/stream/abc.mp4"))
+
+    def test_tiktok_video_detection_rejects_page_and_static_assets(self) -> None:
+        self.assertFalse(
+            dd.looks_like_tiktok_video_url("https://www.tiktok.com/@li_viaris/video/7654516637915188498")
+        )
+        self.assertFalse(dd.looks_like_tiktok_video_url("https://p16-sign.tiktokcdn-us.com/tos/image.jpg"))
+        self.assertTrue(
+            dd.looks_like_tiktok_video_url(
+                "https://v16m.tiktokcdn-us.com/123abc/video.mp4?mime_type=video_mp4"
+            )
+        )
+
+    def test_extract_tiktok_candidates_from_json(self) -> None:
+        payload = {
+            "ItemModule": {
+                "7654516637915188498": {
+                    "video": {
+                        "playAddr": "https://v16m.tiktokcdn-us.com/path/video.mp4?mime_type=video_mp4",
+                        "bitrateInfo": [
+                            {
+                                "PlayAddr": {
+                                    "UrlList": [
+                                        "https://v16m.tiktokcdn-us.com/path/720.mp4?mime_type=video_mp4"
+                                    ]
+                                }
+                            }
+                        ],
+                    }
+                }
+            }
+        }
+        candidates = dd.extract_tiktok_candidates_from_json(payload)
+        self.assertEqual(
+            candidates[0].url,
+            "https://v16m.tiktokcdn-us.com/path/720.mp4?mime_type=video_mp4",
+        )
 
     def test_extract_json_from_state_script(self) -> None:
         html = '<script>window.__INITIAL_STATE__={"video":{"url":"https://sns-video-hw.xhscdn.com/stream/abc"}};</script>'
@@ -147,6 +197,66 @@ class DouyinDownloaderTests(unittest.TestCase):
 
     def test_platform_defaults_to_auto(self) -> None:
         self.assertEqual(dd.parse_args([]).platform, "auto")
+
+    def test_titok_platform_alias_is_accepted(self) -> None:
+        args = dd.parse_args(["--platform", "titok", "https://www.tiktok.com/@u/video/7654516637915188498"])
+        with mock.patch(
+            "media_downloader.gather_web_platform_candidates",
+            return_value=("7654516637915188498", [], [], []),
+        ):
+            with mock.patch(
+                "media_downloader.gather_browser_candidates",
+                return_value=("7654516637915188498", [], [], []),
+            ):
+                platform, _, _, _, _ = dd.gather_candidates_for_request(
+                    args.share,
+                    platform=args.platform,
+                    browser_fallback=True,
+                )
+        self.assertEqual(platform, "tiktok")
+
+    def test_download_candidate_uses_candidate_cookie_and_referer(self) -> None:
+        class FakeResponse:
+            status = 200
+            headers = {"content-type": "video/mp4"}
+
+            def __init__(self) -> None:
+                self.sent = False
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def read(self, size: int = -1) -> bytes:
+                if self.sent:
+                    return b""
+                self.sent = True
+                return b"video"
+
+        candidate = dd.Candidate(
+            "https://v16m.tiktokcdn-us.com/path/video.mp4?mime_type=video_mp4",
+            "test",
+            1,
+            "ttwid=abc; msToken=def",
+            "https://www.tiktok.com/@u/video/7654516637915188498",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "out.mp4"
+            with mock.patch("media_downloader.urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+                dd.download_candidate(candidate, output_path)
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Cookie"), "ttwid=abc; msToken=def")
+        self.assertEqual(request.get_header("Referer"), "https://www.tiktok.com/@u/video/7654516637915188498")
+
+    def test_candidate_metadata_excludes_download_cookie(self) -> None:
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1, "secret=cookie", "https://example.com/")
+        self.assertEqual(
+            dd.candidate_metadata(candidate),
+            {"url": "https://example.com/video.mp4", "source": "test", "priority": 1},
+        )
 
     def test_timestamp_output_name(self) -> None:
         with mock.patch("media_downloader.time.strftime", return_value="20260624_153012"):
