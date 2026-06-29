@@ -1,3 +1,4 @@
+import argparse
 import io
 import sys
 import tempfile
@@ -6,6 +7,60 @@ from pathlib import Path
 from unittest import mock
 
 import media_downloader as dd
+
+
+class FakeReadline:
+    def __init__(self) -> None:
+        self.items: list[str] = []
+        self.history_length: int | None = None
+        self.read_path: str | None = None
+        self.write_path: str | None = None
+        self.completer = None
+        self.completer_delims: str | None = None
+        self.bindings: list[str] = []
+        self.line_buffer = ""
+        self.begidx = 0
+        self.endidx = 0
+
+    def read_history_file(self, path: str) -> None:
+        self.read_path = path
+        self.items = [line.rstrip("\n") for line in Path(path).read_text(encoding="utf-8").splitlines()]
+
+    def write_history_file(self, path: str) -> None:
+        self.write_path = path
+        Path(path).write_text("\n".join(self.items) + ("\n" if self.items else ""), encoding="utf-8")
+
+    def set_history_length(self, length: int) -> None:
+        self.history_length = length
+
+    def get_current_history_length(self) -> int:
+        return len(self.items)
+
+    def get_history_item(self, index: int) -> str | None:
+        if index <= 0 or index > len(self.items):
+            return None
+        return self.items[index - 1]
+
+    def add_history(self, item: str) -> None:
+        self.items.append(item)
+
+    def set_completer(self, completer) -> None:
+        self.completer = completer
+
+    def set_completer_delims(self, delimiters: str) -> None:
+        self.completer_delims = delimiters
+
+    def parse_and_bind(self, binding: str) -> None:
+        self.bindings.append(binding)
+
+    def get_line_buffer(self) -> str:
+        return self.line_buffer
+
+    def get_begidx(self) -> int:
+        return self.begidx
+
+    def get_endidx(self) -> int:
+        return self.endidx
 
 
 class DouyinDownloaderTests(unittest.TestCase):
@@ -129,6 +184,12 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertFalse(dd.parse_args(["--interactive"]).x_compatible)
         self.assertTrue(dd.parse_args(["--interactive", "--x-compatible"]).x_compatible)
 
+    def test_audio_and_transcription_require_explicit_flags(self) -> None:
+        self.assertFalse(dd.parse_args([]).extract_audio)
+        self.assertFalse(dd.parse_args([]).transcribe)
+        self.assertTrue(dd.parse_args(["--extract-audio"]).extract_audio)
+        self.assertTrue(dd.parse_args(["--transcribe"]).transcribe)
+
     def test_browser_fallback_is_enabled_by_default(self) -> None:
         self.assertTrue(dd.parse_args([]).browser_fallback)
         self.assertFalse(dd.parse_args(["--no-browser-fallback"]).browser_fallback)
@@ -147,9 +208,219 @@ class DouyinDownloaderTests(unittest.TestCase):
             "media_downloader.gather_candidates_for_request",
             return_value=("douyin", "7441234567890123456", [], [], logs),
         ):
-            with self.assertRaises(dd.DouyinDownloadError) as raised:
-                dd.handle_share_text(args, args.share, None)
+            with mock.patch("sys.stderr", new_callable=io.StringIO):
+                with self.assertRaises(dd.DouyinDownloadError) as raised:
+                    dd.handle_share_text(args, args.share, None)
         self.assertIn("optional browser fallback was unavailable", str(raised.exception))
+
+    def test_handle_share_text_retries_parse_error_and_prints_attempts(self) -> None:
+        args = dd.parse_args(["--print-url", "https://v.douyin.com/abc123/"])
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            side_effect=[
+                dd.DouyinDownloadError("temporary parse failure"),
+                ("douyin", "7441234567890123456", [candidate], [], []),
+            ],
+        ) as gather:
+            with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        self.assertEqual(gather.call_count, 2)
+        message = stderr.getvalue()
+        self.assertIn("parse_attempt: 1/4", message)
+        self.assertIn("parse_failed: attempt 1/4: temporary parse failure", message)
+        self.assertIn("parse_attempt: 2/4", message)
+
+    def test_handle_share_text_retries_empty_parse_results_three_times(self) -> None:
+        args = dd.parse_args(["https://v.douyin.com/abc123/"])
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("douyin", "7441234567890123456", [], [], []),
+        ) as gather:
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                with self.assertRaises(dd.DouyinDownloadError):
+                    dd.handle_share_text(args, args.share, None)
+
+        self.assertEqual(gather.call_count, dd.PARSE_RETRY_COUNT + 1)
+        message = stderr.getvalue()
+        self.assertIn("parse_attempt: 1/4", message)
+        self.assertIn("parse_attempt: 4/4", message)
+        self.assertEqual(message.count("no downloadable media found"), dd.PARSE_RETRY_COUNT)
+
+    def test_interactive_loop_prints_parse_attempts(self) -> None:
+        args = dd.parse_args(["--interactive", "--print-url"])
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        responses = iter(["https://v.douyin.com/abc123/", "q"])
+        with mock.patch("builtins.input", side_effect=lambda _prompt: next(responses)), mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("douyin", "7441234567890123456", [candidate], [], []),
+        ):
+            with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                self.assertEqual(dd.interactive_loop(args, None), 0)
+
+        self.assertIn("parse_attempt: 1/4", stderr.getvalue())
+
+    def test_interactive_command_toggles_and_sets_options(self) -> None:
+        args = dd.parse_args(["--interactive"])
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            keep_running, cookie = dd.handle_interactive_command(args, ":on transcribe", None)
+            self.assertTrue(keep_running)
+            self.assertIsNone(cookie)
+            self.assertTrue(args.transcribe)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":audio-output downloads/a.wav", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.audio_output, "downloads/a.wav")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":platform titok", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.platform, "tiktok")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":clear audio-output", cookie)
+            self.assertTrue(keep_running)
+            self.assertIsNone(args.audio_output)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":transcribe off", cookie)
+            self.assertTrue(keep_running)
+            self.assertFalse(args.transcribe)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":whisper-progress off", cookie)
+            self.assertTrue(keep_running)
+            self.assertFalse(args.whisper_progress)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":whisper-fast on", cookie)
+            self.assertTrue(keep_running)
+            self.assertTrue(args.whisper_fast)
+
+    def test_interactive_status_prints_current_settings(self) -> None:
+        args = dd.parse_args(["--interactive", "--transcribe", "--output-dir", "videos"])
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            keep_running, cookie = dd.handle_interactive_command(args, ":status", None)
+
+        self.assertTrue(keep_running)
+        self.assertIsNone(cookie)
+        output = stdout.getvalue()
+        self.assertIn("interactive_settings:", output)
+        self.assertIn("transcribe: on", output)
+        self.assertIn("output-dir: videos", output)
+
+    def test_interactive_command_can_update_cookie(self) -> None:
+        args = dd.parse_args(["--interactive"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cookie_path = Path(tmpdir) / "cookies.txt"
+            cookie_path.write_text("session=abc\n", encoding="utf-8")
+            with mock.patch("sys.stdout", new_callable=io.StringIO):
+                keep_running, cookie = dd.handle_interactive_command(args, f":set cookie {cookie_path}", None)
+
+        self.assertTrue(keep_running)
+        self.assertEqual(args.cookie, str(cookie_path))
+        self.assertEqual(cookie, "session=abc")
+
+    def test_interactive_loop_applies_commands_before_download(self) -> None:
+        args = dd.parse_args(["--interactive"])
+        responses = iter(
+            [
+                ":transcribe on",
+                ":set audio-output downloads/custom.wav",
+                "https://v.douyin.com/abc123/",
+                ":quit",
+            ]
+        )
+        calls: list[tuple[bool, str | None, str, str | None]] = []
+
+        def fake_handle_share_text(
+            current_args: object,
+            share_text: str,
+            cookie: str | None,
+        ) -> int:
+            assert isinstance(current_args, argparse.Namespace)
+            calls.append((current_args.transcribe, current_args.audio_output, share_text, cookie))
+            return 0
+
+        with mock.patch("builtins.input", side_effect=lambda _prompt: next(responses)), mock.patch(
+            "media_downloader.handle_share_text",
+            side_effect=fake_handle_share_text,
+        ):
+            with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ):
+                self.assertEqual(dd.interactive_loop(args, None), 0)
+
+        self.assertEqual(calls, [(True, "downloads/custom.wav", "https://v.douyin.com/abc123/", None)])
+
+    def test_interactive_history_loads_prints_and_saves(self) -> None:
+        fake_readline = FakeReadline()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "history.txt"
+            history_path.write_text(":status\n", encoding="utf-8")
+            with mock.patch.object(dd, "readline", fake_readline), mock.patch.object(
+                sys.stdin,
+                "isatty",
+                return_value=True,
+            ), mock.patch.dict(dd.os.environ, {dd.INTERACTIVE_HISTORY_ENV: str(history_path)}, clear=False):
+                loaded_path = dd.setup_interactive_history()
+                dd.add_interactive_history(":status")
+                dd.add_interactive_history(":transcribe on")
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                    dd.print_interactive_history()
+                dd.save_interactive_history(loaded_path)
+
+            self.assertEqual(loaded_path, history_path)
+            self.assertEqual(fake_readline.history_length, dd.INTERACTIVE_HISTORY_LIMIT)
+            self.assertEqual(fake_readline.items, [":status", ":transcribe on"])
+            self.assertIn(":transcribe on", stdout.getvalue())
+            self.assertEqual(history_path.read_text(encoding="utf-8"), ":status\n:transcribe on\n")
+
+    def test_interactive_loop_records_history_when_tty_history_is_available(self) -> None:
+        args = dd.parse_args(["--interactive"])
+        fake_readline = FakeReadline()
+        responses = iter([":status", "q"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "history.txt"
+            with mock.patch.object(dd, "readline", fake_readline), mock.patch.object(
+                sys.stdin,
+                "isatty",
+                return_value=True,
+            ), mock.patch.dict(dd.os.environ, {dd.INTERACTIVE_HISTORY_ENV: str(history_path)}, clear=False), mock.patch(
+                "builtins.input",
+                side_effect=lambda _prompt: next(responses),
+            ):
+                with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                    "sys.stderr",
+                    new_callable=io.StringIO,
+                ):
+                    self.assertEqual(dd.interactive_loop(args, None), 0)
+
+            self.assertEqual(fake_readline.items, [":status", "q"])
+            self.assertEqual(history_path.read_text(encoding="utf-8"), ":status\nq\n")
+
+    def test_interactive_completion_candidates(self) -> None:
+        self.assertIn(":transcribe ", dd.interactive_completion_candidates(":tr", 1, 3))
+        self.assertIn("whisper-model ", dd.interactive_completion_candidates(":set whi", 5, 8))
+        self.assertIn("douyin ", dd.interactive_completion_candidates(":set platform d", 14, 15))
+        self.assertIn("off ", dd.interactive_completion_candidates(":transcribe o", 12, 13))
+
+    def test_interactive_completion_is_registered_with_readline(self) -> None:
+        fake_readline = FakeReadline()
+        with mock.patch.object(dd, "readline", fake_readline):
+            dd.setup_interactive_completion()
+
+        self.assertIsNotNone(fake_readline.completer)
+        self.assertEqual(fake_readline.completer_delims, " \t\n")
+        self.assertIn("tab: complete", fake_readline.bindings)
+
+        fake_readline.line_buffer = ":sta"
+        fake_readline.begidx = 1
+        fake_readline.endidx = 4
+        self.assertEqual(fake_readline.completer("", 0), ":status ")
 
     def test_handle_share_text_prints_video_media_type(self) -> None:
         args = dd.parse_args(["--print-url", "https://v.douyin.com/abc123/"])
@@ -194,6 +465,192 @@ class DouyinDownloaderTests(unittest.TestCase):
             ) as stderr:
                 self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
         self.assertIn("detected_media: images", stderr.getvalue())
+
+    def test_handle_share_text_does_not_extract_audio_by_default(self) -> None:
+        args = dd.parse_args(["https://v.douyin.com/abc123/"])
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_path = Path(tmpdir) / "video.mp4"
+            with mock.patch(
+                "media_downloader.gather_candidates_for_request",
+                return_value=("douyin", "7441234567890123456", [candidate], [], []),
+            ), mock.patch("media_downloader.download_candidate", return_value=saved_path), mock.patch(
+                "media_downloader.video_transcriber.extract_audio",
+            ) as extract_audio:
+                with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                    "sys.stderr",
+                    new_callable=io.StringIO,
+                ):
+                    self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        extract_audio.assert_not_called()
+
+    def test_handle_share_text_extracts_audio_and_transcribes_when_requested(self) -> None:
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_path = Path(tmpdir) / "video.mp4"
+            audio_path = Path(tmpdir) / "custom_audio.wav"
+            transcript_path = Path(tmpdir) / "custom_text.txt"
+            args = dd.parse_args(
+                [
+                    "--extract-audio",
+                    "--transcribe",
+                    "--audio-output",
+                    str(audio_path),
+                    "--text-output",
+                    str(transcript_path),
+                    "--whisper-bin",
+                    "/bin/whisper-cli",
+                    "--whisper-model",
+                    "/models/ggml-small.bin",
+                    "--whisper-threads",
+                    "2",
+                    "https://v.douyin.com/abc123/",
+                ]
+            )
+            with mock.patch(
+                "media_downloader.gather_candidates_for_request",
+                return_value=("douyin", "7441234567890123456", [candidate], [], []),
+            ), mock.patch("media_downloader.download_candidate", return_value=saved_path), mock.patch(
+                "media_downloader.video_transcriber.extract_audio",
+                return_value=audio_path,
+            ) as extract_audio, mock.patch(
+                "media_downloader.video_transcriber.find_whisper_binary",
+                return_value=Path("/bin/whisper-cli"),
+            ) as find_whisper_binary, mock.patch(
+                "media_downloader.video_transcriber.find_whisper_model",
+                return_value=Path("/models/ggml-small.bin"),
+            ) as find_whisper_model, mock.patch(
+                "media_downloader.video_transcriber.transcribe_audio",
+                return_value=transcript_path,
+            ) as transcribe_audio:
+                with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, mock.patch(
+                    "sys.stderr",
+                    new_callable=io.StringIO,
+                ):
+                    self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        self.assertEqual(extract_audio.call_args.args[:2], (saved_path, audio_path))
+        self.assertEqual(extract_audio.call_args.kwargs["sample_rate"], dd.video_transcriber.DEFAULT_SAMPLE_RATE)
+        self.assertEqual(extract_audio.call_args.kwargs["channels"], dd.video_transcriber.DEFAULT_CHANNELS)
+        find_whisper_binary.assert_called_once_with("/bin/whisper-cli")
+        find_whisper_model.assert_called_once_with("/models/ggml-small.bin")
+        self.assertEqual(transcribe_audio.call_args.args[:2], (audio_path, transcript_path))
+        self.assertEqual(transcribe_audio.call_args.kwargs["threads"], 2)
+        self.assertTrue(transcribe_audio.call_args.kwargs["print_progress"])
+        self.assertFalse(transcribe_audio.call_args.kwargs["fast"])
+        output = stdout.getvalue()
+        self.assertIn(f"audio: {audio_path}", output)
+        self.assertIn(f"transcript: {transcript_path}", output)
+
+    def test_handle_share_text_can_enable_fast_transcription(self) -> None:
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_path = Path(tmpdir) / "video.mp4"
+            audio_path = Path(tmpdir) / "video_audio.wav"
+            transcript_path = Path(tmpdir) / "video_transcript.txt"
+            args = dd.parse_args(["--transcribe", "--whisper-fast", "https://v.douyin.com/abc123/"])
+            with mock.patch(
+                "media_downloader.gather_candidates_for_request",
+                return_value=("douyin", "7441234567890123456", [candidate], [], []),
+            ), mock.patch("media_downloader.download_candidate", return_value=saved_path), mock.patch(
+                "media_downloader.video_transcriber.extract_audio",
+                return_value=audio_path,
+            ), mock.patch(
+                "media_downloader.video_transcriber.find_whisper_binary",
+                return_value=Path("/bin/whisper-cli"),
+            ), mock.patch(
+                "media_downloader.video_transcriber.find_whisper_model",
+                return_value=Path("/models/ggml-small.bin"),
+            ), mock.patch(
+                "media_downloader.video_transcriber.transcribe_audio",
+                return_value=transcript_path,
+            ) as transcribe_audio:
+                with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                    "sys.stderr",
+                    new_callable=io.StringIO,
+                ):
+                    self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        self.assertTrue(transcribe_audio.call_args.kwargs["fast"])
+
+    def test_handle_share_text_can_disable_transcription_progress(self) -> None:
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_path = Path(tmpdir) / "video.mp4"
+            audio_path = Path(tmpdir) / "video_audio.wav"
+            transcript_path = Path(tmpdir) / "video_transcript.txt"
+            args = dd.parse_args(["--transcribe", "--whisper-no-progress", "https://v.douyin.com/abc123/"])
+            with mock.patch(
+                "media_downloader.gather_candidates_for_request",
+                return_value=("douyin", "7441234567890123456", [candidate], [], []),
+            ), mock.patch("media_downloader.download_candidate", return_value=saved_path), mock.patch(
+                "media_downloader.video_transcriber.extract_audio",
+                return_value=audio_path,
+            ), mock.patch(
+                "media_downloader.video_transcriber.find_whisper_binary",
+                return_value=Path("/bin/whisper-cli"),
+            ), mock.patch(
+                "media_downloader.video_transcriber.find_whisper_model",
+                return_value=Path("/models/ggml-small.bin"),
+            ), mock.patch(
+                "media_downloader.video_transcriber.transcribe_audio",
+                return_value=transcript_path,
+            ) as transcribe_audio:
+                with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                    "sys.stderr",
+                    new_callable=io.StringIO,
+                ):
+                    self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        self.assertFalse(transcribe_audio.call_args.kwargs["print_progress"])
+
+    def test_handle_share_text_extract_audio_does_not_transcribe_without_flag(self) -> None:
+        args = dd.parse_args(["--extract-audio", "https://v.douyin.com/abc123/"])
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_path = Path(tmpdir) / "video.mp4"
+            audio_path = Path(tmpdir) / "video_audio.wav"
+            with mock.patch(
+                "media_downloader.gather_candidates_for_request",
+                return_value=("douyin", "7441234567890123456", [candidate], [], []),
+            ), mock.patch("media_downloader.download_candidate", return_value=saved_path), mock.patch(
+                "media_downloader.video_transcriber.extract_audio",
+                return_value=audio_path,
+            ) as extract_audio, mock.patch(
+                "media_downloader.video_transcriber.transcribe_audio",
+            ) as transcribe_audio:
+                with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                    "sys.stderr",
+                    new_callable=io.StringIO,
+                ):
+                    self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        extract_audio.assert_called_once()
+        transcribe_audio.assert_not_called()
+
+    def test_audio_options_are_ignored_for_image_only_posts(self) -> None:
+        args = dd.parse_args(["--transcribe", "https://www.xiaohongshu.com/discovery/item/abc"])
+        image_candidate = dd.ImageCandidate("https://example.com/image.jpg", "test", 1)
+        saved_paths = [Path("downloads/image.jpg")]
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("xiaohongshu", "abc", [], [image_candidate], []),
+        ), mock.patch(
+            "media_downloader.download_image_candidates",
+            return_value=saved_paths,
+        ) as download_images, mock.patch(
+            "media_downloader.video_transcriber.extract_audio",
+        ) as extract_audio:
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ):
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        download_images.assert_called_once()
+        extract_audio.assert_not_called()
+        self.assertIn("downloads/image.jpg", stdout.getvalue())
 
     def test_platform_defaults_to_auto(self) -> None:
         self.assertEqual(dd.parse_args([]).platform, "auto")

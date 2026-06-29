@@ -13,7 +13,9 @@ import argparse
 import html
 import http.cookiejar
 import json
+import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -25,6 +27,13 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
+
+import video_transcriber
+
+try:
+    import readline
+except ImportError:  # pragma: no cover - depends on platform Python build.
+    readline = None  # type: ignore[assignment]
 
 
 DEFAULT_HEADERS = {
@@ -90,6 +99,9 @@ PLATFORMS = ("auto", "douyin", "kuaishou", "xiaohongshu", "tiktok")
 PLATFORM_ALIASES = {"titok": "tiktok"}
 PLATFORM_CHOICES = PLATFORMS + tuple(PLATFORM_ALIASES)
 OUTPUT_TIME_FORMAT = "%Y%m%d_%H%M%S"
+PARSE_RETRY_COUNT = 3
+INTERACTIVE_HISTORY_LIMIT = 1000
+INTERACTIVE_HISTORY_ENV = "MEDIA_DOWNLOADER_HISTORY"
 CHROMIUM_BROWSER_EXECUTABLES = (
     "google-chrome",
     "google-chrome-stable",
@@ -1750,6 +1762,67 @@ def make_x_compatible_if_needed(path: Path, args: argparse.Namespace) -> Path | 
     return converted
 
 
+def audio_text_processing_requested(args: argparse.Namespace) -> bool:
+    return bool(args.extract_audio or args.transcribe)
+
+
+def extract_audio_and_transcribe_if_needed(path: Path, args: argparse.Namespace) -> None:
+    if not audio_text_processing_requested(args):
+        return
+
+    audio_path = video_transcriber.output_path_for(
+        path,
+        args.audio_output,
+        None,
+        video_transcriber.DEFAULT_AUDIO_SUFFIX,
+        ".wav",
+    )
+    try:
+        saved_audio = video_transcriber.extract_audio(
+            path,
+            audio_path,
+            overwrite=args.overwrite,
+            sample_rate=args.audio_sample_rate,
+            channels=args.audio_channels,
+            verbose=args.verbose,
+        )
+    except Exception as exc:
+        raise DouyinDownloadError(f"Audio extraction failed: {exc}") from exc
+    print(f"audio: {saved_audio}")
+
+    if not args.transcribe:
+        return
+
+    transcript_path = video_transcriber.output_path_for(
+        path,
+        args.text_output,
+        None,
+        video_transcriber.DEFAULT_TRANSCRIPT_SUFFIX,
+        ".txt",
+    )
+    try:
+        whisper_bin = video_transcriber.find_whisper_binary(args.whisper_bin)
+        model_path = video_transcriber.find_whisper_model(args.whisper_model)
+        transcript = video_transcriber.transcribe_audio(
+            saved_audio,
+            transcript_path,
+            whisper_bin=whisper_bin,
+            model_path=model_path,
+            language=args.whisper_language,
+            threads=args.whisper_threads,
+            translate=args.whisper_translate,
+            fast=args.whisper_fast,
+            no_gpu=args.whisper_no_gpu,
+            no_timestamps=not args.whisper_timestamps,
+            print_progress=args.whisper_progress,
+            overwrite=args.overwrite,
+            verbose=args.verbose,
+        )
+    except Exception as exc:
+        raise DouyinDownloadError(f"Audio transcription failed: {exc}") from exc
+    print(f"transcript: {transcript}")
+
+
 def read_share_text(args: argparse.Namespace) -> str:
     if args.input_file:
         return Path(args.input_file).expanduser().read_text(encoding="utf-8")
@@ -1766,6 +1839,48 @@ def media_type_message(platform: str, candidates: list[Candidate], image_candida
     if image_candidates:
         return f"detected_media: images (platform={platform}, count={len(image_candidates)})"
     return f"detected_media: unknown (platform={platform})"
+
+
+def gather_candidates_for_request_with_retries(
+    args: argparse.Namespace,
+    share_text: str,
+    cookie: str | None,
+) -> tuple[str, str | None, list[Candidate], list[ImageCandidate], list[str]]:
+    max_attempts = PARSE_RETRY_COUNT + 1
+    last_result: tuple[str, str | None, list[Candidate], list[ImageCandidate], list[str]] | None = None
+    for attempt in range(1, max_attempts + 1):
+        print(f"parse_attempt: {attempt}/{max_attempts}", file=sys.stderr)
+        try:
+            result = gather_candidates_for_request(
+                share_text,
+                platform=args.platform,
+                cookie=cookie,
+                timeout=args.timeout,
+                browser_fallback=args.browser_fallback,
+                browser_timeout=args.browser_timeout,
+                chrome_path=args.chrome_path,
+            )
+        except (DouyinDownloadError, OSError) as exc:
+            if attempt >= max_attempts:
+                raise
+            print(f"parse_failed: attempt {attempt}/{max_attempts}: {exc}", file=sys.stderr)
+            continue
+
+        platform, _item_id, candidates, image_candidates, _logs = result
+        if candidates or image_candidates:
+            return result
+
+        last_result = result
+        if attempt < max_attempts:
+            print(
+                f"parse_failed: attempt {attempt}/{max_attempts}: "
+                f"no downloadable media found for platform={platform}",
+                file=sys.stderr,
+            )
+
+    if last_result is None:
+        raise DouyinDownloadError("Parsing failed before producing a result.")
+    return last_result
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1854,6 +1969,82 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Print resolution, duration, codec, bitrate, and file size after download.",
     )
     parser.add_argument(
+        "--extract-audio",
+        action="store_true",
+        help="After a successful video download, extract a separate WAV audio file.",
+    )
+    parser.add_argument(
+        "--transcribe",
+        action="store_true",
+        help="After a successful video download, extract audio and transcribe it with local whisper.cpp.",
+    )
+    parser.add_argument(
+        "--audio-output",
+        help="Output WAV path for --extract-audio or --transcribe. Default: downloaded video stem plus _audio.wav",
+    )
+    parser.add_argument(
+        "--text-output",
+        help="Output transcript TXT path for --transcribe. Default: downloaded video stem plus _transcript.txt",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=video_transcriber.DEFAULT_SAMPLE_RATE,
+        help="Sample rate for extracted WAV audio. Default: 16000",
+    )
+    parser.add_argument(
+        "--audio-channels",
+        type=int,
+        default=video_transcriber.DEFAULT_CHANNELS,
+        help="Channel count for extracted WAV audio. Default: 1",
+    )
+    parser.add_argument(
+        "--whisper-bin",
+        help="Path or executable name for whisper.cpp whisper-cli used by --transcribe.",
+    )
+    parser.add_argument(
+        "--whisper-model",
+        help="Path to a whisper.cpp ggml model used by --transcribe.",
+    )
+    parser.add_argument(
+        "--whisper-language",
+        default=video_transcriber.DEFAULT_LANGUAGE,
+        help="Spoken language for whisper.cpp, or auto. Default: auto",
+    )
+    parser.add_argument(
+        "--whisper-threads",
+        type=int,
+        default=video_transcriber.default_whisper_threads(),
+        help=f"Thread count passed to whisper.cpp. Default: auto, capped at {video_transcriber.DEFAULT_MAX_THREADS}",
+    )
+    parser.add_argument(
+        "--whisper-translate",
+        action="store_true",
+        help="Ask whisper.cpp to translate speech to English.",
+    )
+    parser.add_argument(
+        "--whisper-fast",
+        action="store_true",
+        help="Use faster greedy whisper.cpp decoding. May reduce transcription quality.",
+    )
+    parser.add_argument(
+        "--whisper-no-gpu",
+        action="store_true",
+        help="Pass --no-gpu to whisper.cpp.",
+    )
+    parser.add_argument(
+        "--whisper-timestamps",
+        action="store_true",
+        help="Keep timestamps in whisper.cpp text output.",
+    )
+    parser.add_argument(
+        "--whisper-no-progress",
+        dest="whisper_progress",
+        action="store_false",
+        default=True,
+        help="Disable whisper.cpp progress output.",
+    )
+    parser.add_argument(
         "--x-compatible",
         action="store_true",
         default=False,
@@ -1899,18 +2090,514 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def interactive_history_path() -> Path:
+    configured = os.environ.get(INTERACTIVE_HISTORY_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".media_downloader_history"
+
+
+def setup_interactive_history(*, force: bool = False) -> Path | None:
+    if readline is None:
+        return None
+    if not force and not sys.stdin.isatty():
+        return None
+
+    history_path = interactive_history_path()
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        if history_path.exists():
+            readline.read_history_file(str(history_path))
+        readline.set_history_length(INTERACTIVE_HISTORY_LIMIT)
+        setup_interactive_completion()
+    except OSError as exc:
+        print(f"warning: could not load interactive history: {exc}", file=sys.stderr)
+        return None
+    return history_path
+
+
+def save_interactive_history(history_path: Path | None) -> None:
+    if readline is None or history_path is None:
+        return
+    try:
+        readline.set_history_length(INTERACTIVE_HISTORY_LIMIT)
+        readline.write_history_file(str(history_path))
+    except OSError as exc:
+        print(f"warning: could not save interactive history: {exc}", file=sys.stderr)
+
+
+def add_interactive_history(text: str) -> None:
+    if readline is None:
+        return
+    entry = text.strip()
+    if not entry:
+        return
+    history_length = readline.get_current_history_length()
+    if history_length > 0 and readline.get_history_item(history_length) == entry:
+        return
+    readline.add_history(entry)
+
+
+def print_interactive_history(limit: int = 20) -> None:
+    if readline is None:
+        print("interactive_history: unavailable")
+        return
+    history_length = readline.get_current_history_length()
+    if history_length <= 0:
+        print("interactive_history: empty")
+        return
+    start = max(1, history_length - limit + 1)
+    print("interactive_history:")
+    for index in range(start, history_length + 1):
+        item = readline.get_history_item(index)
+        if item:
+            print(f"  {index}: {item}")
+
+
+INTERACTIVE_BASE_COMMANDS = (
+    "help",
+    "history",
+    "status",
+    "on",
+    "off",
+    "toggle",
+    "set",
+    "clear",
+    "quit",
+    "exit",
+    "q",
+)
+
+INTERACTIVE_BOOL_OPTIONS = {
+    "browser-fallback": "browser_fallback",
+    "extract-audio": "extract_audio",
+    "audio": "extract_audio",
+    "print-url": "print_url",
+    "save-meta": "save_meta",
+    "show-info": "show_info",
+    "transcribe": "transcribe",
+    "stt": "transcribe",
+    "verbose": "verbose",
+    "whisper-fast": "whisper_fast",
+    "whisper-no-gpu": "whisper_no_gpu",
+    "whisper-progress": "whisper_progress",
+    "whisper-timestamps": "whisper_timestamps",
+    "whisper-translate": "whisper_translate",
+    "overwrite": "overwrite",
+    "x-compatible": "x_compatible",
+    "x-force": "x_force",
+    "x-overwrite": "x_overwrite",
+}
+
+INTERACTIVE_VALUE_OPTIONS = {
+    "audio-channels": ("audio_channels", int, video_transcriber.DEFAULT_CHANNELS),
+    "audio-output": ("audio_output", str, None),
+    "audio-sample-rate": ("audio_sample_rate", int, video_transcriber.DEFAULT_SAMPLE_RATE),
+    "browser-timeout": ("browser_timeout", float, 12.0),
+    "chrome-path": ("chrome_path", str, None),
+    "cookie": ("cookie", str, None),
+    "output-dir": ("output_dir", str, "downloads"),
+    "output-name": ("output_name", str, None),
+    "platform": ("platform", str, "auto"),
+    "text-output": ("text_output", str, None),
+    "timeout": ("timeout", float, 20.0),
+    "whisper-bin": ("whisper_bin", str, None),
+    "whisper-language": ("whisper_language", str, video_transcriber.DEFAULT_LANGUAGE),
+    "whisper-model": ("whisper_model", str, None),
+    "whisper-threads": ("whisper_threads", int, video_transcriber.default_whisper_threads()),
+    "x-crf": ("x_crf", int, 23),
+    "x-output-dir": ("x_output_dir", str, None),
+}
+
+INTERACTIVE_STATUS_OPTIONS = [
+    "platform",
+    "output-dir",
+    "output-name",
+    "print-url",
+    "save-meta",
+    "show-info",
+    "overwrite",
+    "browser-fallback",
+    "timeout",
+    "browser-timeout",
+    "extract-audio",
+    "transcribe",
+    "audio-output",
+    "text-output",
+    "whisper-language",
+    "whisper-threads",
+    "whisper-fast",
+    "whisper-no-gpu",
+    "whisper-progress",
+    "x-compatible",
+    "x-force",
+    "x-output-dir",
+    "verbose",
+]
+
+INTERACTIVE_COMMAND_OPTIONS = tuple(
+    sorted(set(INTERACTIVE_BASE_COMMANDS) | set(INTERACTIVE_BOOL_OPTIONS) | set(INTERACTIVE_VALUE_OPTIONS))
+)
+INTERACTIVE_OPTION_NAMES = tuple(sorted(set(INTERACTIVE_BOOL_OPTIONS) | set(INTERACTIVE_VALUE_OPTIONS)))
+INTERACTIVE_BOOL_VALUES = ("on", "off", "toggle")
+INTERACTIVE_PLATFORM_VALUES = ("auto", "douyin", "kuaishou", "xiaohongshu", "tiktok")
+
+
+def interactive_option_key(name: str) -> str:
+    return name.strip().lower().replace("_", "-")
+
+
+def matching_completions(prefix: str, candidates: Iterable[str]) -> list[str]:
+    normalized_prefix = interactive_option_key(prefix)
+    return [candidate for candidate in candidates if candidate.startswith(normalized_prefix)]
+
+
+def whitespace_tokens_before_cursor(line: str, endidx: int) -> list[str]:
+    before_cursor = line[:endidx]
+    if not before_cursor.strip():
+        return []
+    return before_cursor.split()
+
+
+def interactive_value_completions(option: str, prefix: str) -> list[str]:
+    normalized = interactive_option_key(option)
+    if normalized in INTERACTIVE_BOOL_OPTIONS:
+        return matching_completions(prefix, INTERACTIVE_BOOL_VALUES)
+    if normalized == "platform":
+        return matching_completions(prefix, INTERACTIVE_PLATFORM_VALUES)
+    return []
+
+
+def interactive_completion_candidates(line: str, begidx: int, endidx: int) -> list[str]:
+    stripped = line.lstrip()
+    if not stripped.startswith((':', '/')):
+        return []
+
+    leading_offset = len(line) - len(stripped)
+    command_prefix = stripped[0]
+    cursor = max(0, endidx - leading_offset)
+    command_line = stripped[1:]
+    command_endidx = max(0, cursor - 1)
+    tokens = whitespace_tokens_before_cursor(command_line, command_endidx)
+    current = command_line[max(0, begidx - leading_offset - 1) : command_endidx]
+    current = current.strip()
+
+    if not tokens:
+        return [f"{command_prefix}{candidate} " for candidate in INTERACTIVE_COMMAND_OPTIONS]
+
+    first = interactive_option_key(tokens[0])
+    completing_first_token = len(tokens) == 1 and not command_line[:command_endidx].endswith((" ", "\t"))
+    if completing_first_token:
+        return [f"{command_prefix}{candidate} " for candidate in matching_completions(first, INTERACTIVE_COMMAND_OPTIONS)]
+
+    if first in {"on", "off", "toggle", "clear"}:
+        return [f"{candidate} " for candidate in matching_completions(current, INTERACTIVE_OPTION_NAMES)]
+
+    if first == "set":
+        if len(tokens) <= 2 and not command_line[:command_endidx].endswith((" ", "\t")):
+            return [f"{candidate} " for candidate in matching_completions(current, INTERACTIVE_OPTION_NAMES)]
+        if len(tokens) == 1 and command_line[:command_endidx].endswith((" ", "\t")):
+            return [f"{candidate} " for candidate in INTERACTIVE_OPTION_NAMES]
+        option = tokens[1] if len(tokens) >= 2 else ""
+        return [f"{candidate} " for candidate in interactive_value_completions(option, current)]
+
+    return [f"{candidate} " for candidate in interactive_value_completions(first, current)]
+
+
+def make_interactive_completer(readline_module: Any | None = None) -> Any:
+    reader = readline_module or readline
+    matches: list[str] = []
+
+    def completer(text: str, state: int) -> str | None:
+        nonlocal matches
+        if reader is None:
+            return None
+        if state == 0:
+            line = reader.get_line_buffer()
+            begidx = reader.get_begidx()
+            endidx = reader.get_endidx()
+            matches = interactive_completion_candidates(line, begidx, endidx)
+        if state < len(matches):
+            return matches[state]
+        return None
+
+    return completer
+
+
+def setup_interactive_completion() -> None:
+    if readline is None:
+        return
+    try:
+        readline.set_completer(make_interactive_completer(readline))
+        if hasattr(readline, "set_completer_delims"):
+            readline.set_completer_delims(" \t\n")
+        readline.parse_and_bind("tab: complete")
+    except (OSError, AttributeError) as exc:
+        print(f"warning: could not enable interactive completion: {exc}", file=sys.stderr)
+
+
+def parse_interactive_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "on", "yes", "y", "enable", "enabled"}:
+        return True
+    if lowered in {"0", "false", "off", "no", "n", "disable", "disabled"}:
+        return False
+    raise DouyinDownloadError(f"Expected on/off, got: {value}")
+
+
+def format_interactive_value(args: argparse.Namespace, key: str) -> str:
+    normalized = interactive_option_key(key)
+    if normalized in INTERACTIVE_BOOL_OPTIONS:
+        value = getattr(args, INTERACTIVE_BOOL_OPTIONS[normalized])
+        return "on" if value else "off"
+    if normalized in INTERACTIVE_VALUE_OPTIONS:
+        dest, _converter, _default = INTERACTIVE_VALUE_OPTIONS[normalized]
+        value = getattr(args, dest)
+        if normalized == "cookie":
+            return "<set>" if value else "<empty>"
+        return "<empty>" if value is None else str(value)
+    raise DouyinDownloadError(f"Unknown interactive option: {key}")
+
+
+def print_interactive_setting(args: argparse.Namespace, key: str) -> None:
+    print(f"{interactive_option_key(key)}: {format_interactive_value(args, key)}")
+
+
+def print_interactive_status(args: argparse.Namespace) -> None:
+    print("interactive_settings:")
+    for key in INTERACTIVE_STATUS_OPTIONS:
+        print(f"  {key}: {format_interactive_value(args, key)}")
+
+
+def print_interactive_help() -> None:
+    print(
+        "\n".join(
+            [
+                "Interactive commands:",
+                "  :help                         show this help",
+                "  :status                       show current settings",
+                "  :history                      show recent input history",
+                "  :on <option>                  turn a boolean option on",
+                "  :off <option>                 turn a boolean option off",
+                "  :toggle <option>              toggle a boolean option",
+                "  :set <option> <value>         set an option value",
+                "  :clear <option>               reset an option to its default",
+                "  :<option> on|off              shortcut for booleans",
+                "  :<option> <value>             shortcut for values",
+                "  :quit                         exit interactive mode",
+                "Boolean options:",
+                "  "
+                + ", ".join(
+                    [
+                        "browser-fallback",
+                        "extract-audio",
+                        "print-url",
+                        "save-meta",
+                        "show-info",
+                        "transcribe",
+                        "verbose",
+                        "whisper-fast",
+                        "whisper-no-gpu",
+                        "whisper-progress",
+                        "whisper-timestamps",
+                        "whisper-translate",
+                        "overwrite",
+                        "x-compatible",
+                        "x-force",
+                        "x-overwrite",
+                    ]
+                ),
+                "Value options:",
+                "  "
+                + ", ".join(
+                    [
+                        "platform",
+                        "output-dir",
+                        "output-name",
+                        "timeout",
+                        "browser-timeout",
+                        "chrome-path",
+                        "cookie",
+                        "audio-output",
+                        "text-output",
+                        "audio-sample-rate",
+                        "audio-channels",
+                        "whisper-bin",
+                        "whisper-model",
+                        "whisper-language",
+                        "whisper-threads",
+                        "x-crf",
+                        "x-output-dir",
+                    ]
+                ),
+            ]
+        )
+    )
+
+
+def set_interactive_option(
+    args: argparse.Namespace,
+    key: str,
+    raw_value: str,
+    cookie: str | None,
+) -> str | None:
+    normalized = interactive_option_key(key)
+    if normalized in INTERACTIVE_BOOL_OPTIONS:
+        setattr(args, INTERACTIVE_BOOL_OPTIONS[normalized], parse_interactive_bool(raw_value))
+        print_interactive_setting(args, normalized)
+        return cookie
+
+    if normalized not in INTERACTIVE_VALUE_OPTIONS:
+        raise DouyinDownloadError(f"Unknown interactive option: {key}")
+
+    dest, converter, _default = INTERACTIVE_VALUE_OPTIONS[normalized]
+    try:
+        value = converter(raw_value)
+    except ValueError as exc:
+        raise DouyinDownloadError(f"Invalid value for {normalized}: {raw_value}") from exc
+    if normalized == "platform":
+        value = normalize_platform(str(value))
+        if value not in PLATFORMS:
+            raise DouyinDownloadError(
+                "Invalid platform. Use auto, douyin, kuaishou, xiaohongshu, or tiktok."
+            )
+
+    setattr(args, dest, value)
+    if normalized == "cookie":
+        cookie = normalize_cookie(str(value))
+    print_interactive_setting(args, normalized)
+    return cookie
+
+
+def clear_interactive_option(args: argparse.Namespace, key: str, cookie: str | None) -> str | None:
+    normalized = interactive_option_key(key)
+    if normalized in INTERACTIVE_BOOL_OPTIONS:
+        setattr(args, INTERACTIVE_BOOL_OPTIONS[normalized], False)
+        print_interactive_setting(args, normalized)
+        return cookie
+    if normalized not in INTERACTIVE_VALUE_OPTIONS:
+        raise DouyinDownloadError(f"Unknown interactive option: {key}")
+
+    dest, _converter, default = INTERACTIVE_VALUE_OPTIONS[normalized]
+    setattr(args, dest, default)
+    if normalized == "cookie":
+        cookie = None
+    print_interactive_setting(args, normalized)
+    return cookie
+
+
+def toggle_interactive_option(args: argparse.Namespace, key: str) -> None:
+    normalized = interactive_option_key(key)
+    if normalized not in INTERACTIVE_BOOL_OPTIONS:
+        raise DouyinDownloadError(f"Option is not a boolean toggle: {key}")
+    dest = INTERACTIVE_BOOL_OPTIONS[normalized]
+    setattr(args, dest, not getattr(args, dest))
+    print_interactive_setting(args, normalized)
+
+
+def interactive_command_tokens(command_text: str) -> list[str]:
+    try:
+        return shlex.split(command_text)
+    except ValueError as exc:
+        raise DouyinDownloadError(f"Invalid interactive command: {exc}") from exc
+
+
+def handle_interactive_command(
+    args: argparse.Namespace,
+    raw_text: str,
+    cookie: str | None,
+) -> tuple[bool, str | None]:
+    command_text = raw_text[1:].strip()
+    if not command_text:
+        print_interactive_help()
+        return True, cookie
+
+    tokens = interactive_command_tokens(command_text)
+    if not tokens:
+        print_interactive_help()
+        return True, cookie
+
+    command = interactive_option_key(tokens[0])
+    if command in {"exit", "quit", "q"}:
+        return False, cookie
+    if command in {"help", "h", "?"}:
+        print_interactive_help()
+        return True, cookie
+    if command in {"status", "settings"}:
+        print_interactive_status(args)
+        return True, cookie
+    if command in {"history", "hist"}:
+        limit = 20
+        if len(tokens) > 2:
+            raise DouyinDownloadError("Usage: :history [limit]")
+        if len(tokens) == 2:
+            try:
+                limit = int(tokens[1])
+            except ValueError as exc:
+                raise DouyinDownloadError(f"Invalid history limit: {tokens[1]}") from exc
+            if limit <= 0:
+                raise DouyinDownloadError("History limit must be greater than 0.")
+        print_interactive_history(limit)
+        return True, cookie
+    if command in {"on", "enable"}:
+        if len(tokens) != 2:
+            raise DouyinDownloadError("Usage: :on <option>")
+        cookie = set_interactive_option(args, tokens[1], "on", cookie)
+        return True, cookie
+    if command in {"off", "disable"}:
+        if len(tokens) != 2:
+            raise DouyinDownloadError("Usage: :off <option>")
+        cookie = set_interactive_option(args, tokens[1], "off", cookie)
+        return True, cookie
+    if command == "toggle":
+        if len(tokens) != 2:
+            raise DouyinDownloadError("Usage: :toggle <option>")
+        toggle_interactive_option(args, tokens[1])
+        return True, cookie
+    if command == "set":
+        if len(tokens) < 3:
+            raise DouyinDownloadError("Usage: :set <option> <value>")
+        cookie = set_interactive_option(args, tokens[1], " ".join(tokens[2:]), cookie)
+        return True, cookie
+    if command == "clear":
+        if len(tokens) != 2:
+            raise DouyinDownloadError("Usage: :clear <option>")
+        cookie = clear_interactive_option(args, tokens[1], cookie)
+        return True, cookie
+
+    if command in INTERACTIVE_BOOL_OPTIONS:
+        if len(tokens) == 1:
+            toggle_interactive_option(args, command)
+        elif len(tokens) == 2 and interactive_option_key(tokens[1]) == "toggle":
+            toggle_interactive_option(args, command)
+        elif len(tokens) == 2:
+            cookie = set_interactive_option(args, command, tokens[1], cookie)
+        else:
+            raise DouyinDownloadError(f"Usage: :{command} [on|off|toggle]")
+        return True, cookie
+
+    if command in INTERACTIVE_VALUE_OPTIONS:
+        if len(tokens) == 1:
+            print_interactive_setting(args, command)
+        else:
+            cookie = set_interactive_option(args, command, " ".join(tokens[1:]), cookie)
+        return True, cookie
+
+    raise DouyinDownloadError(f"Unknown interactive command: {tokens[0]}. Type :help for commands.")
+
+
+def is_interactive_command(text: str) -> bool:
+    return text.startswith((':', '/'))
+
+
 def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | None) -> int:
     if not share_text.strip():
         raise DouyinDownloadError("No share text was provided.")
 
-    platform, item_id, candidates, image_candidates, logs = gather_candidates_for_request(
+    platform, item_id, candidates, image_candidates, logs = gather_candidates_for_request_with_retries(
+        args,
         share_text,
-        platform=args.platform,
-        cookie=cookie,
-        timeout=args.timeout,
-        browser_fallback=args.browser_fallback,
-        browser_timeout=args.browser_timeout,
-        chrome_path=args.chrome_path,
+        cookie,
     )
 
     if args.verbose:
@@ -1942,6 +2629,9 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
         raise DouyinDownloadError(message)
 
     print(media_type_message(platform, candidates, image_candidates), file=sys.stderr)
+
+    if args.print_url and audio_text_processing_requested(args):
+        raise DouyinDownloadError("--print-url cannot be used with --extract-audio or --transcribe.")
 
     if args.print_url:
         if candidates:
@@ -1996,46 +2686,67 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
                 timeout=args.timeout,
                 referer=platform_referer(platform),
             )
-            if args.save_meta:
-                save_metadata(saved_path.with_suffix(".json"), platform, item_id, candidates, image_candidates, logs)
-            if args.show_info:
-                print_media_info(saved_path)
-            else:
-                print(saved_path)
-            if args.x_compatible:
-                try:
-                    make_x_compatible_if_needed(saved_path, args)
-                except Exception as exc:
-                    raise DouyinDownloadError(f"X-compatible transcode failed: {exc}") from exc
-            return 0
         except DouyinDownloadError as exc:
             last_error = exc
             if args.verbose:
                 print(f"Rejected candidate: {exc}", file=sys.stderr)
+            continue
+
+        if args.save_meta:
+            save_metadata(saved_path.with_suffix(".json"), platform, item_id, candidates, image_candidates, logs)
+        if args.show_info:
+            print_media_info(saved_path)
+        else:
+            print(saved_path)
+        extract_audio_and_transcribe_if_needed(saved_path, args)
+        if args.x_compatible:
+            try:
+                make_x_compatible_if_needed(saved_path, args)
+            except Exception as exc:
+                raise DouyinDownloadError(f"X-compatible transcode failed: {exc}") from exc
+        return 0
 
     raise DouyinDownloadError(f"All candidates failed. Last error: {last_error}")
 
 
 def interactive_loop(args: argparse.Namespace, cookie: str | None) -> int:
     print("Media Downloader interactive mode")
-    print("Paste Douyin/Kuaishou/Xiaohongshu/TikTok share text or URL, then press Enter. Type exit/quit/q to leave.")
-    while True:
-        try:
-            share_text = input("media> ").strip()
-        except (EOFError, KeyboardInterrupt):
+    print("Paste share text or URL, then press Enter. Type :help for commands; exit/quit/q to leave.")
+    active_cookie = cookie
+    history_path = setup_interactive_history()
+    try:
+        while True:
+            try:
+                raw_share_text = input("media> ")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            if history_path is not None:
+                add_interactive_history(raw_share_text)
+            share_text = raw_share_text.strip()
+
+            if not share_text:
+                continue
+            if share_text.lower() in {"exit", "quit", "q"}:
+                return 0
+            if is_interactive_command(share_text):
+                keep_running = True
+                try:
+                    keep_running, active_cookie = handle_interactive_command(args, share_text, active_cookie)
+                except (DouyinDownloadError, OSError) as exc:
+                    print(f"error: {exc}", file=sys.stderr)
+                if not keep_running:
+                    return 0
+                print()
+                continue
+
+            try:
+                handle_share_text(args, share_text, active_cookie)
+            except (DouyinDownloadError, OSError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
             print()
-            return 0
-
-        if not share_text:
-            continue
-        if share_text.lower() in {"exit", "quit", "q"}:
-            return 0
-
-        try:
-            handle_share_text(args, share_text, cookie)
-        except (DouyinDownloadError, OSError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-        print()
+    finally:
+        save_interactive_history(history_path)
 
 
 def should_start_interactive(args: argparse.Namespace) -> bool:

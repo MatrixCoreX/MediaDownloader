@@ -28,6 +28,8 @@ detected_media: images (platform=xiaohongshu, count=1)
 
 媒体类型提示输出到 `stderr`。URL、下载后的文件路径输出到 `stdout`，方便配合管道或脚本处理。
 
+解析失败时会自动重试 3 次；每次解析都会向 `stderr` 打印 `parse_attempt: 当前次数/总次数`。交互模式和一次性模式一致。
+
 默认输出文件名使用本地时间：
 
 ```text
@@ -62,7 +64,26 @@ python3 media_downloader.py
 python3 media_downloader.py --interactive
 ```
 
-启动后粘贴分享文案并回车，下载完成后会继续回到输入提示符。输入 `exit`、`quit` 或 `q` 退出。
+启动后粘贴分享文案并回车，下载完成后会继续回到输入提示符。输入 `exit`、`quit` 或 `q` 退出。终端里可以用方向键上/下翻看历史输入，Tab 可以补齐交互命令和参数名；有多个匹配项时，终端会显示候选列表。历史默认保存到 `~/.media_downloader_history`；也可以用环境变量 `MEDIA_DOWNLOADER_HISTORY` 指定历史文件路径。
+
+交互模式里可以用 `:` 或 `/` 开头的命令临时修改后续下载参数。常用命令：
+
+```text
+:help
+:status
+:history
+:on transcribe
+:off transcribe
+:toggle verbose
+:set platform douyin
+:set output-dir downloads
+:set audio-output downloads/input_audio.wav
+:set text-output downloads/input_transcript.txt
+:clear audio-output
+:quit
+```
+
+布尔参数也支持快捷写法，例如 `:transcribe on`、`:extract-audio off`、`:x-compatible toggle`。路径、平台、超时、whisper 模型等参数支持 `:set 参数名 值`；输入 `:status` 可以查看当前配置。
 
 手动指定平台：
 
@@ -139,6 +160,131 @@ python3 x_transcoder.py --check downloads/input.mp4
 python3 x_transcoder.py downloads/input.mp4
 ```
 
+## 本机语音转文字
+
+`video_transcriber.py` 会先用 `ffmpeg` 从视频里拆出单独的 16 kHz 单声道 WAV 音频，再调用本机 `whisper.cpp` 生成文字稿。
+
+主下载器默认只下载视频。只有显式加参数时，才会在同一次运行里下载视频后继续拆音频或转文字。
+
+如果解析到的是图文作品，`--extract-audio` 和 `--transcribe` 会被忽略，仍只保存图片。
+
+下载视频后同时拆音频：
+
+```bash
+python3 media_downloader.py --extract-audio "https://v.douyin.com/xxxx/"
+```
+
+下载视频后同时拆音频并转文字：
+
+```bash
+python3 media_downloader.py --transcribe "https://v.douyin.com/xxxx/"
+```
+
+转文字时默认会打印 whisper.cpp 的进度。默认线程数会按本机 CPU 自动选择，并最多使用 8 个线程；也可以手动指定：
+
+```bash
+python3 media_downloader.py --transcribe --whisper-threads 8 "https://v.douyin.com/xxxx/"
+```
+
+如果不想打印转写进度：
+
+```bash
+python3 media_downloader.py --transcribe --whisper-no-progress "https://v.douyin.com/xxxx/"
+```
+
+如果更看重速度，可以开启快速解码模式。它会让 whisper.cpp 使用更轻的解码参数，可能略微降低识别稳健性：
+
+```bash
+python3 media_downloader.py --transcribe --whisper-fast "https://v.douyin.com/xxxx/"
+```
+
+音频和文字输出路径使用独立参数：
+
+```bash
+python3 media_downloader.py \
+  --transcribe \
+  --audio-output downloads/input_audio.wav \
+  --text-output downloads/input_transcript.txt \
+  "https://v.douyin.com/xxxx/"
+```
+
+默认输出路径会基于下载后的视频文件名生成：
+
+```text
+downloads/20260624_153012.mp4
+downloads/20260624_153012_audio.wav
+downloads/20260624_153012_transcript.txt
+```
+
+交互模式同样需要显式加参数：
+
+```bash
+python3 media_downloader.py --interactive --transcribe
+```
+
+交互模式中可以临时调节转写参数：
+
+```text
+:whisper-progress off
+:whisper-threads 8
+:whisper-fast on
+:whisper-no-gpu on
+```
+
+如果需要指定 whisper.cpp 路径或模型：
+
+```bash
+python3 media_downloader.py \
+  --transcribe \
+  --whisper-bin ~/rustclaw/data/vendor/whisper.cpp/build/bin/whisper-cli \
+  --whisper-model ~/rustclaw/data/models/whisper.cpp/ggml-small.bin \
+  "https://v.douyin.com/xxxx/"
+```
+
+也可以单独处理本地已有视频。
+
+转写最新下载的视频：
+
+```bash
+python3 video_transcriber.py
+```
+
+转写指定视频：
+
+```bash
+python3 video_transcriber.py downloads/input.mp4
+```
+
+单独转写本地文件时同样默认打印进度，并自动选择线程数。可以用 `--threads` 调速，用 `--no-progress` 关闭进度输出；需要进一步提速时可以加 `--fast`。
+
+```bash
+python3 video_transcriber.py --threads 8 downloads/input.mp4
+python3 video_transcriber.py --fast downloads/input.mp4
+python3 video_transcriber.py --no-progress downloads/input.mp4
+```
+
+默认会输出：
+
+```text
+downloads/input_audio.wav
+downloads/input_transcript.txt
+```
+
+只拆音频、不转文字：
+
+```bash
+python3 video_transcriber.py --extract-only downloads/input.mp4
+```
+
+如果本机 `whisper.cpp` 不在 PATH，脚本会自动尝试使用 `~/rustclaw/data/vendor/whisper.cpp/build/bin/whisper-cli` 和 `~/rustclaw/data/models/whisper.cpp/ggml-small.bin`。也可以手动指定：
+
+```bash
+python3 video_transcriber.py \
+  --whisper-bin ~/rustclaw/data/vendor/whisper.cpp/build/bin/whisper-cli \
+  --model ~/rustclaw/data/models/whisper.cpp/ggml-small.bin \
+  downloads/input.mp4
+```
+
 ## 浏览器 fallback
 
 默认启用本机 Chromium 系浏览器 fallback。支持 Chrome、Chromium、Microsoft Edge、Brave、Vivaldi 等 Chromium 系浏览器。
@@ -180,6 +326,8 @@ python3 media_downloader.py --cookie cookies.txt "https://v.douyin.com/xxxx/"
 `--show-info` 需要系统安装 `ffprobe`。如果没有安装，工具仍会下载，但只能显示基础文件大小。
 
 `--x-compatible` 和 `x_transcoder.py` 需要系统安装 `ffmpeg` 和 `ffprobe`。不加 `--x-compatible` 时，主下载脚本不会执行 X 兼容检查或转码。
+
+`video_transcriber.py` 需要系统安装 `ffmpeg`，并需要可用的本机 `whisper.cpp` 可执行文件和 ggml 模型。
 
 ## 说明
 
