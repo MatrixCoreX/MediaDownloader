@@ -193,6 +193,7 @@ class DouyinDownloaderTests(unittest.TestCase):
     def test_browser_fallback_is_enabled_by_default(self) -> None:
         self.assertTrue(dd.parse_args([]).browser_fallback)
         self.assertFalse(dd.parse_args(["--no-browser-fallback"]).browser_fallback)
+        self.assertEqual(dd.parse_args([]).browser_timeout, dd.DEFAULT_BROWSER_TIMEOUT)
 
     def test_finds_non_google_chromium_browser(self) -> None:
         def fake_which(executable: str) -> str | None:

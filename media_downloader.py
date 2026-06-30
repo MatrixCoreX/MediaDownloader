@@ -100,6 +100,7 @@ PLATFORM_ALIASES = {"titok": "tiktok"}
 PLATFORM_CHOICES = PLATFORMS + tuple(PLATFORM_ALIASES)
 OUTPUT_TIME_FORMAT = "%Y%m%d_%H%M%S"
 PARSE_RETRY_COUNT = 3
+DEFAULT_BROWSER_TIMEOUT = 30.0
 INTERACTIVE_HISTORY_LIMIT = 1000
 INTERACTIVE_HISTORY_ENV = "MEDIA_DOWNLOADER_HISTORY"
 CHROMIUM_BROWSER_EXECUTABLES = (
@@ -1083,7 +1084,7 @@ def gather_browser_candidates(
     *,
     platform: str,
     cookie: str | None = None,
-    timeout: float = 12.0,
+    timeout: float = DEFAULT_BROWSER_TIMEOUT,
     chrome_path: str | None = None,
 ) -> tuple[str | None, list[Candidate], list[ImageCandidate], list[str]]:
     platform = normalize_platform(platform)
@@ -1401,7 +1402,7 @@ def gather_candidates_for_request(
     cookie: str | None = None,
     timeout: float = 20.0,
     browser_fallback: bool = True,
-    browser_timeout: float = 12.0,
+    browser_timeout: float = DEFAULT_BROWSER_TIMEOUT,
     chrome_path: str | None = None,
 ) -> tuple[str, str | None, list[Candidate], list[ImageCandidate], list[str]]:
     platform = normalize_platform(platform)
@@ -1948,8 +1949,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--browser-timeout",
         type=float,
-        default=12.0,
-        help="Seconds to let browser fallback load the page. Default: 12",
+        default=DEFAULT_BROWSER_TIMEOUT,
+        help=f"Seconds to let browser fallback load the page. Default: {DEFAULT_BROWSER_TIMEOUT:g}",
     )
     parser.add_argument(
         "--chrome-path",
@@ -2200,7 +2201,7 @@ INTERACTIVE_VALUE_OPTIONS = {
     "audio-channels": ("audio_channels", int, video_transcriber.DEFAULT_CHANNELS),
     "audio-output": ("audio_output", str, None),
     "audio-sample-rate": ("audio_sample_rate", int, video_transcriber.DEFAULT_SAMPLE_RATE),
-    "browser-timeout": ("browser_timeout", float, 12.0),
+    "browser-timeout": ("browser_timeout", float, DEFAULT_BROWSER_TIMEOUT),
     "chrome-path": ("chrome_path", str, None),
     "cookie": ("cookie", str, None),
     "output-dir": ("output_dir", str, "downloads"),

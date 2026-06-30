@@ -305,10 +305,10 @@ python3 video_transcriber.py \
 python3 media_downloader.py --no-browser-fallback "https://v.douyin.com/xxxx/"
 ```
 
-指定浏览器路径或调大浏览器加载时间：
+浏览器 fallback 默认最多等待 30 秒。页面较慢时，可以指定浏览器路径或继续调大浏览器加载时间：
 
 ```bash
-python3 media_downloader.py --chrome-path /usr/bin/google-chrome --browser-timeout 25 "https://v.douyin.com/xxxx/"
+python3 media_downloader.py --chrome-path /usr/bin/google-chrome --browser-timeout 45 "https://v.douyin.com/xxxx/"
 ```
 
 如果系统没有可用浏览器，脚本仍会尝试直连解析；需要浏览器 fallback 的页面可能会解析失败，并给出缺少浏览器的提示。
