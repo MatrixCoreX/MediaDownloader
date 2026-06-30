@@ -2,6 +2,7 @@ import io
 import os
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -246,6 +247,102 @@ class VideoTranscriberTests(unittest.TestCase):
                     ),
                     transcript_path,
                 )
+
+    def test_extract_funasr_text_handles_common_result_shapes(self) -> None:
+        self.assertEqual(vt.extract_funasr_text("hello"), "hello")
+        self.assertEqual(vt.extract_funasr_text({"text": "hello"}), "hello")
+        self.assertEqual(vt.extract_funasr_text([{"text": "hello"}, {"text": "world"}]), "hello\nworld")
+
+    def test_postprocess_funasr_text_uses_rich_postprocess_when_available(self) -> None:
+        fake_funasr = types.ModuleType("funasr")
+        fake_funasr.__path__ = []  # type: ignore[attr-defined]
+        fake_utils = types.ModuleType("funasr.utils")
+        fake_utils.__path__ = []  # type: ignore[attr-defined]
+        fake_postprocess = types.ModuleType("funasr.utils.postprocess_utils")
+        fake_postprocess.rich_transcription_postprocess = lambda text: "处理后文本"  # type: ignore[attr-defined]
+
+        modules = {
+            "funasr": fake_funasr,
+            "funasr.utils": fake_utils,
+            "funasr.utils.postprocess_utils": fake_postprocess,
+        }
+        with mock.patch.dict("sys.modules", modules):
+            self.assertEqual(vt.postprocess_funasr_text("<|zh|>原始文本"), "处理后文本")
+
+    def test_transcribe_audio_with_funasr_writes_text(self) -> None:
+        calls: dict[str, object] = {}
+
+        class FakeAutoModel:
+            def __init__(self, **kwargs: object) -> None:
+                calls["model_kwargs"] = kwargs
+
+            def generate(self, **kwargs: object) -> list[dict[str, str]]:
+                calls["generate_kwargs"] = kwargs
+                return [{"text": "<|zh|><|NEUTRAL|>你好，世界。"}]
+
+        fake_funasr = types.ModuleType("funasr")
+        fake_funasr.__path__ = []  # type: ignore[attr-defined]
+        fake_funasr.AutoModel = FakeAutoModel  # type: ignore[attr-defined]
+        fake_utils = types.ModuleType("funasr.utils")
+        fake_utils.__path__ = []  # type: ignore[attr-defined]
+        fake_postprocess = types.ModuleType("funasr.utils.postprocess_utils")
+        fake_postprocess.rich_transcription_postprocess = lambda text: text.replace("你好", "您好")  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "video_audio.wav"
+            transcript_path = Path(tmpdir) / "video_transcript.txt"
+            audio_path.write_text("audio", encoding="utf-8")
+            modules = {
+                "funasr": fake_funasr,
+                "funasr.utils": fake_utils,
+                "funasr.utils.postprocess_utils": fake_postprocess,
+            }
+            with mock.patch.dict("sys.modules", modules):
+                self.assertEqual(
+                    vt.transcribe_audio_with_funasr(
+                        audio_path,
+                        transcript_path,
+                        model="iic/SenseVoiceSmall",
+                        device="cpu",
+                        vad_model="fsmn-vad",
+                        punc_model=None,
+                    ),
+                    transcript_path,
+                )
+
+            self.assertEqual(transcript_path.read_text(encoding="utf-8"), "您好，世界。\n")
+            self.assertEqual(
+                calls["model_kwargs"],
+                {"model": "iic/SenseVoiceSmall", "device": "cpu", "vad_model": "fsmn-vad"},
+            )
+            self.assertEqual(
+                calls["generate_kwargs"],
+                {"input": str(audio_path), "batch_size_s": vt.DEFAULT_FUNASR_BATCH_SIZE_S, "use_itn": True},
+            )
+
+    def test_transcribe_audio_with_engine_dispatches_funasr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "video_audio.wav"
+            transcript_path = Path(tmpdir) / "video_transcript.txt"
+            audio_path.write_text("audio", encoding="utf-8")
+            with mock.patch(
+                "video_transcriber.transcribe_audio_with_funasr",
+                return_value=transcript_path,
+            ) as funasr:
+                self.assertEqual(
+                    vt.transcribe_audio_with_engine(
+                        audio_path,
+                        transcript_path,
+                        engine="funasr",
+                        funasr_model="local-model",
+                        funasr_device="cpu",
+                    ),
+                    transcript_path,
+                )
+
+            self.assertEqual(funasr.call_args.args[:2], (audio_path, transcript_path))
+            self.assertEqual(funasr.call_args.kwargs["model"], "local-model")
+            self.assertEqual(funasr.call_args.kwargs["device"], "cpu")
 
     def test_main_transcribes_wav_input_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

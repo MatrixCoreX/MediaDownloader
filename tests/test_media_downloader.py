@@ -189,6 +189,8 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertFalse(dd.parse_args([]).transcribe)
         self.assertTrue(dd.parse_args(["--extract-audio"]).extract_audio)
         self.assertTrue(dd.parse_args(["--transcribe"]).transcribe)
+        self.assertEqual(dd.parse_args([]).transcribe_engine, dd.video_transcriber.DEFAULT_TRANSCRIBE_ENGINE)
+        self.assertEqual(dd.parse_args(["--transcribe-engine", "funasr"]).transcribe_engine, "funasr")
 
     def test_browser_fallback_is_enabled_by_default(self) -> None:
         self.assertTrue(dd.parse_args([]).browser_fallback)
@@ -283,6 +285,18 @@ class DouyinDownloaderTests(unittest.TestCase):
             keep_running, cookie = dd.handle_interactive_command(args, ":platform titok", cookie)
             self.assertTrue(keep_running)
             self.assertEqual(args.platform, "tiktok")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":transcribe-engine funasr", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.transcribe_engine, "funasr")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":funasr-device cpu", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.funasr_device, "cpu")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":clear transcribe-engine", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.transcribe_engine, dd.video_transcriber.DEFAULT_TRANSCRIBE_ENGINE)
 
             keep_running, cookie = dd.handle_interactive_command(args, ":clear audio-output", cookie)
             self.assertTrue(keep_running)
@@ -422,7 +436,9 @@ class DouyinDownloaderTests(unittest.TestCase):
     def test_interactive_completion_candidates(self) -> None:
         self.assertIn(":transcribe ", dd.interactive_completion_candidates(":tr", 1, 3))
         self.assertIn("whisper-model ", dd.interactive_completion_candidates(":set whi", 5, 8))
+        self.assertIn("funasr-model ", dd.interactive_completion_candidates(":set fun", 5, 8))
         self.assertIn("douyin ", dd.interactive_completion_candidates(":set platform d", 14, 15))
+        self.assertIn("funasr ", dd.interactive_completion_candidates(":set transcribe-engine f", 23, 24))
         self.assertIn("off ", dd.interactive_completion_candidates(":transcribe o", 12, 13))
 
     def test_interactive_completion_is_registered_with_readline(self) -> None:
@@ -621,6 +637,50 @@ class DouyinDownloaderTests(unittest.TestCase):
                     self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
 
         self.assertFalse(transcribe_audio.call_args.kwargs["print_progress"])
+
+    def test_handle_share_text_can_use_funasr_engine(self) -> None:
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_path = Path(tmpdir) / "video.mp4"
+            audio_path = Path(tmpdir) / "video_audio.wav"
+            transcript_path = Path(tmpdir) / "video_transcript.txt"
+            args = dd.parse_args(
+                [
+                    "--transcribe",
+                    "--transcribe-engine",
+                    "funasr",
+                    "--funasr-model",
+                    "iic/SenseVoiceSmall",
+                    "--funasr-device",
+                    "cpu",
+                    "https://v.douyin.com/abc123/",
+                ]
+            )
+            with mock.patch(
+                "media_downloader.gather_candidates_for_request",
+                return_value=("douyin", "7441234567890123456", [candidate], [], []),
+            ), mock.patch("media_downloader.download_candidate", return_value=saved_path), mock.patch(
+                "media_downloader.video_transcriber.extract_audio",
+                return_value=audio_path,
+            ), mock.patch(
+                "media_downloader.video_transcriber.find_whisper_binary",
+            ) as find_whisper_binary, mock.patch(
+                "media_downloader.video_transcriber.find_whisper_model",
+            ) as find_whisper_model, mock.patch(
+                "media_downloader.video_transcriber.transcribe_audio_with_engine",
+                return_value=transcript_path,
+            ) as transcribe:
+                with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                    "sys.stderr",
+                    new_callable=io.StringIO,
+                ):
+                    self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        find_whisper_binary.assert_not_called()
+        find_whisper_model.assert_not_called()
+        self.assertEqual(transcribe.call_args.kwargs["engine"], "funasr")
+        self.assertEqual(transcribe.call_args.kwargs["funasr_model"], "iic/SenseVoiceSmall")
+        self.assertEqual(transcribe.call_args.kwargs["funasr_device"], "cpu")
 
     def test_handle_share_text_extract_audio_does_not_transcribe_without_flag(self) -> None:
         args = dd.parse_args(["--extract-audio", "https://v.douyin.com/abc123/"])

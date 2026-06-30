@@ -1804,13 +1804,22 @@ def extract_audio_and_transcribe_if_needed(path: Path, args: argparse.Namespace)
         ".txt",
     )
     try:
-        whisper_bin = video_transcriber.find_whisper_binary(args.whisper_bin)
-        model_path = video_transcriber.find_whisper_model(args.whisper_model)
-        transcript = video_transcriber.transcribe_audio(
+        whisper_bin = (
+            video_transcriber.find_whisper_binary(args.whisper_bin)
+            if args.transcribe_engine == "whisper"
+            else None
+        )
+        model_path = (
+            video_transcriber.find_whisper_model(args.whisper_model)
+            if args.transcribe_engine == "whisper"
+            else None
+        )
+        transcript = video_transcriber.transcribe_audio_with_engine(
             saved_audio,
             transcript_path,
+            engine=args.transcribe_engine,
             whisper_bin=whisper_bin,
-            model_path=model_path,
+            whisper_model_path=model_path,
             language=args.whisper_language,
             threads=args.whisper_threads,
             translate=args.whisper_translate,
@@ -1818,6 +1827,11 @@ def extract_audio_and_transcribe_if_needed(path: Path, args: argparse.Namespace)
             no_gpu=args.whisper_no_gpu,
             no_timestamps=not args.whisper_timestamps,
             print_progress=args.whisper_progress,
+            funasr_model=args.funasr_model,
+            funasr_device=args.funasr_device,
+            funasr_vad_model=args.funasr_vad_model,
+            funasr_punc_model=args.funasr_punc_model,
+            funasr_batch_size_s=args.funasr_batch_size_s,
             overwrite=args.overwrite,
             verbose=args.verbose,
         )
@@ -1979,7 +1993,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--transcribe",
         action="store_true",
-        help="After a successful video download, extract audio and transcribe it with local whisper.cpp.",
+        help="After a successful video download, extract audio and transcribe it with a local ASR engine.",
     )
     parser.add_argument(
         "--audio-output",
@@ -2004,6 +2018,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--whisper-bin",
         help="Path or executable name for whisper.cpp whisper-cli used by --transcribe.",
+    )
+    parser.add_argument(
+        "--transcribe-engine",
+        choices=video_transcriber.TRANSCRIBE_ENGINES,
+        default=video_transcriber.DEFAULT_TRANSCRIBE_ENGINE,
+        help=f"Local transcription engine for --transcribe. Default: {video_transcriber.DEFAULT_TRANSCRIBE_ENGINE}",
     )
     parser.add_argument(
         "--whisper-model",
@@ -2048,6 +2068,32 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Disable whisper.cpp progress output.",
     )
     parser.add_argument(
+        "--funasr-model",
+        default=video_transcriber.DEFAULT_FUNASR_MODEL,
+        help=f"FunASR model id or local path used by --transcribe-engine funasr. Default: {video_transcriber.DEFAULT_FUNASR_MODEL}",
+    )
+    parser.add_argument(
+        "--funasr-device",
+        default=video_transcriber.DEFAULT_FUNASR_DEVICE,
+        help=f"FunASR device used by --transcribe-engine funasr. Default: {video_transcriber.DEFAULT_FUNASR_DEVICE}",
+    )
+    parser.add_argument(
+        "--funasr-vad-model",
+        default=video_transcriber.DEFAULT_FUNASR_VAD_MODEL,
+        help=f"FunASR VAD model, or none/off. Default: {video_transcriber.DEFAULT_FUNASR_VAD_MODEL}",
+    )
+    parser.add_argument(
+        "--funasr-punc-model",
+        default=video_transcriber.DEFAULT_FUNASR_PUNC_MODEL,
+        help="Optional FunASR punctuation model, or none/off. Default: none",
+    )
+    parser.add_argument(
+        "--funasr-batch-size-s",
+        type=int,
+        default=video_transcriber.DEFAULT_FUNASR_BATCH_SIZE_S,
+        help=f"FunASR batch duration in seconds. Default: {video_transcriber.DEFAULT_FUNASR_BATCH_SIZE_S}",
+    )
+    parser.add_argument(
         "--x-compatible",
         action="store_true",
         default=False,
@@ -2088,7 +2134,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "-v",
         "--verbose",
         action="store_true",
-        help="Print resolver logs and candidate URLs.",
+        help="Print resolver logs, candidate URLs, and ASR command/config details.",
     )
     return parser.parse_args(argv)
 
@@ -2204,11 +2250,17 @@ INTERACTIVE_VALUE_OPTIONS = {
     "browser-timeout": ("browser_timeout", float, DEFAULT_BROWSER_TIMEOUT),
     "chrome-path": ("chrome_path", str, None),
     "cookie": ("cookie", str, None),
+    "funasr-batch-size-s": ("funasr_batch_size_s", int, video_transcriber.DEFAULT_FUNASR_BATCH_SIZE_S),
+    "funasr-device": ("funasr_device", str, video_transcriber.DEFAULT_FUNASR_DEVICE),
+    "funasr-model": ("funasr_model", str, video_transcriber.DEFAULT_FUNASR_MODEL),
+    "funasr-punc-model": ("funasr_punc_model", str, video_transcriber.DEFAULT_FUNASR_PUNC_MODEL),
+    "funasr-vad-model": ("funasr_vad_model", str, video_transcriber.DEFAULT_FUNASR_VAD_MODEL),
     "output-dir": ("output_dir", str, "downloads"),
     "output-name": ("output_name", str, None),
     "platform": ("platform", str, "auto"),
     "text-output": ("text_output", str, None),
     "timeout": ("timeout", float, 20.0),
+    "transcribe-engine": ("transcribe_engine", str, video_transcriber.DEFAULT_TRANSCRIBE_ENGINE),
     "whisper-bin": ("whisper_bin", str, None),
     "whisper-language": ("whisper_language", str, video_transcriber.DEFAULT_LANGUAGE),
     "whisper-model": ("whisper_model", str, None),
@@ -2232,6 +2284,12 @@ INTERACTIVE_STATUS_OPTIONS = [
     "transcribe",
     "audio-output",
     "text-output",
+    "transcribe-engine",
+    "funasr-model",
+    "funasr-device",
+    "funasr-vad-model",
+    "funasr-punc-model",
+    "funasr-batch-size-s",
     "whisper-language",
     "whisper-threads",
     "whisper-fast",
@@ -2249,6 +2307,7 @@ INTERACTIVE_COMMAND_OPTIONS = tuple(
 INTERACTIVE_OPTION_NAMES = tuple(sorted(set(INTERACTIVE_BOOL_OPTIONS) | set(INTERACTIVE_VALUE_OPTIONS)))
 INTERACTIVE_BOOL_VALUES = ("on", "off", "toggle")
 INTERACTIVE_PLATFORM_VALUES = ("auto", "douyin", "kuaishou", "xiaohongshu", "tiktok")
+INTERACTIVE_TRANSCRIBE_ENGINE_VALUES = video_transcriber.TRANSCRIBE_ENGINES
 
 
 def interactive_option_key(name: str) -> str:
@@ -2273,6 +2332,8 @@ def interactive_value_completions(option: str, prefix: str) -> list[str]:
         return matching_completions(prefix, INTERACTIVE_BOOL_VALUES)
     if normalized == "platform":
         return matching_completions(prefix, INTERACTIVE_PLATFORM_VALUES)
+    if normalized == "transcribe-engine":
+        return matching_completions(prefix, INTERACTIVE_TRANSCRIBE_ENGINE_VALUES)
     return []
 
 
@@ -2430,6 +2491,12 @@ def print_interactive_help() -> None:
                         "text-output",
                         "audio-sample-rate",
                         "audio-channels",
+                        "transcribe-engine",
+                        "funasr-model",
+                        "funasr-device",
+                        "funasr-vad-model",
+                        "funasr-punc-model",
+                        "funasr-batch-size-s",
                         "whisper-bin",
                         "whisper-model",
                         "whisper-language",
@@ -2468,6 +2535,12 @@ def set_interactive_option(
         if value not in PLATFORMS:
             raise DouyinDownloadError(
                 "Invalid platform. Use auto, douyin, kuaishou, xiaohongshu, or tiktok."
+            )
+    if normalized == "transcribe-engine":
+        value = str(value).lower()
+        if value not in video_transcriber.TRANSCRIBE_ENGINES:
+            raise DouyinDownloadError(
+                f"Invalid transcribe-engine. Use {', '.join(video_transcriber.TRANSCRIBE_ENGINES)}."
             )
 
     setattr(args, dest, value)

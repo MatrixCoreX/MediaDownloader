@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Extract audio from a local media file and transcribe it with local whisper.cpp.
+Extract audio from a local media file and transcribe it with a local ASR engine.
 """
 
 from __future__ import annotations
@@ -22,6 +22,14 @@ DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_CHANNELS = 1
 DEFAULT_LANGUAGE = "auto"
 DEFAULT_MAX_THREADS = 8
+DEFAULT_TRANSCRIBE_ENGINE = "whisper"
+TRANSCRIBE_ENGINES = ("whisper", "funasr")
+DEFAULT_FUNASR_MODEL = "iic/SenseVoiceSmall"
+DEFAULT_FUNASR_DEVICE = "cpu"
+DEFAULT_FUNASR_VAD_MODEL = "fsmn-vad"
+DEFAULT_FUNASR_PUNC_MODEL = None
+DEFAULT_FUNASR_BATCH_SIZE_S = 60
+FUNASR_RICH_TAG_RE = re.compile(r"<\|[^|>]+?\|>")
 MEDIA_EXTENSIONS = {
     ".mp4",
     ".mov",
@@ -334,6 +342,16 @@ def command_error(command_name: str, completed: subprocess.CompletedProcess[str]
     return VideoTranscribeError(f"{command_name} failed with exit code {completed.returncode}{detail}")
 
 
+def prepare_transcript_output(transcript_path: Path, *, overwrite: bool) -> None:
+    if transcript_path.exists():
+        if not overwrite:
+            raise VideoTranscribeError(
+                f"Transcript output already exists, pass --overwrite to replace it: {transcript_path}"
+            )
+        transcript_path.unlink()
+    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+
+
 def extract_audio(
     input_path: Path,
     audio_path: Path,
@@ -428,14 +446,7 @@ def transcribe_audio(
 ) -> Path:
     if not audio_path.exists():
         raise VideoTranscribeError(f"Audio file does not exist: {audio_path}")
-    if transcript_path.exists():
-        if not overwrite:
-            raise VideoTranscribeError(
-                f"Transcript output already exists, pass --overwrite to replace it: {transcript_path}"
-            )
-        transcript_path.unlink()
-
-    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+    prepare_transcript_output(transcript_path, overwrite=overwrite)
     transcript_prefix = transcript_prefix_for(transcript_path)
     command = build_whisper_command(
         whisper_bin,
@@ -458,19 +469,166 @@ def transcribe_audio(
     return transcript_path
 
 
+def normalize_optional_model(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() in {"none", "off", "false", "no", "disabled"}:
+        return None
+    return stripped
+
+
+def extract_funasr_text(result: object) -> str:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        text = result.get("text")
+        return text if isinstance(text, str) else ""
+    if isinstance(result, list):
+        parts = [extract_funasr_text(item) for item in result]
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def postprocess_funasr_text(text: str) -> str:
+    try:
+        from funasr.utils.postprocess_utils import rich_transcription_postprocess
+    except ImportError:
+        processed = text
+    else:
+        try:
+            processed = rich_transcription_postprocess(text)
+        except Exception:
+            processed = text
+    return FUNASR_RICH_TAG_RE.sub("", processed).strip()
+
+
+def transcribe_audio_with_funasr(
+    audio_path: Path,
+    transcript_path: Path,
+    *,
+    model: str = DEFAULT_FUNASR_MODEL,
+    device: str = DEFAULT_FUNASR_DEVICE,
+    vad_model: str | None = DEFAULT_FUNASR_VAD_MODEL,
+    punc_model: str | None = DEFAULT_FUNASR_PUNC_MODEL,
+    batch_size_s: int = DEFAULT_FUNASR_BATCH_SIZE_S,
+    overwrite: bool = False,
+    verbose: bool = False,
+) -> Path:
+    if not audio_path.exists():
+        raise VideoTranscribeError(f"Audio file does not exist: {audio_path}")
+    prepare_transcript_output(transcript_path, overwrite=overwrite)
+
+    try:
+        from funasr import AutoModel
+    except ImportError as exc:
+        raise VideoTranscribeError(
+            "FunASR is not installed in the current Python environment. "
+            "Install it with: python -m pip install funasr modelscope torch torchaudio"
+        ) from exc
+
+    model_kwargs: dict[str, object] = {
+        "model": model,
+        "device": device,
+    }
+    normalized_vad_model = normalize_optional_model(vad_model)
+    normalized_punc_model = normalize_optional_model(punc_model)
+    if normalized_vad_model:
+        model_kwargs["vad_model"] = normalized_vad_model
+    if normalized_punc_model:
+        model_kwargs["punc_model"] = normalized_punc_model
+    if verbose:
+        print(f"funasr_model: {model_kwargs}", file=sys.stderr)
+
+    try:
+        recognizer = AutoModel(**model_kwargs)
+        result = recognizer.generate(
+            input=str(audio_path),
+            batch_size_s=batch_size_s,
+            use_itn=True,
+        )
+    except Exception as exc:
+        raise VideoTranscribeError(f"FunASR failed: {exc}") from exc
+
+    text = postprocess_funasr_text(extract_funasr_text(result))
+    if not text:
+        raise VideoTranscribeError("FunASR completed but returned no transcript text")
+    transcript_path.write_text(text + "\n", encoding="utf-8")
+    return transcript_path
+
+
+def transcribe_audio_with_engine(
+    audio_path: Path,
+    transcript_path: Path,
+    *,
+    engine: str = DEFAULT_TRANSCRIBE_ENGINE,
+    whisper_bin: Path | None = None,
+    whisper_model_path: Path | None = None,
+    language: str = DEFAULT_LANGUAGE,
+    threads: int | None = None,
+    translate: bool = False,
+    no_gpu: bool = False,
+    no_timestamps: bool = False,
+    print_progress: bool = True,
+    fast: bool = False,
+    funasr_model: str = DEFAULT_FUNASR_MODEL,
+    funasr_device: str = DEFAULT_FUNASR_DEVICE,
+    funasr_vad_model: str | None = DEFAULT_FUNASR_VAD_MODEL,
+    funasr_punc_model: str | None = DEFAULT_FUNASR_PUNC_MODEL,
+    funasr_batch_size_s: int = DEFAULT_FUNASR_BATCH_SIZE_S,
+    overwrite: bool = False,
+    verbose: bool = False,
+) -> Path:
+    normalized_engine = engine.lower()
+    if normalized_engine == "whisper":
+        if whisper_bin is None:
+            raise VideoTranscribeError("whisper.cpp binary was not resolved")
+        if whisper_model_path is None:
+            raise VideoTranscribeError("whisper.cpp model was not resolved")
+        return transcribe_audio(
+            audio_path,
+            transcript_path,
+            whisper_bin=whisper_bin,
+            model_path=whisper_model_path,
+            language=language,
+            threads=threads,
+            translate=translate,
+            no_gpu=no_gpu,
+            no_timestamps=no_timestamps,
+            print_progress=print_progress,
+            fast=fast,
+            overwrite=overwrite,
+            verbose=verbose,
+        )
+    if normalized_engine == "funasr":
+        return transcribe_audio_with_funasr(
+            audio_path,
+            transcript_path,
+            model=funasr_model,
+            device=funasr_device,
+            vad_model=funasr_vad_model,
+            punc_model=funasr_punc_model,
+            batch_size_s=funasr_batch_size_s,
+            overwrite=overwrite,
+            verbose=verbose,
+        )
+    raise VideoTranscribeError(f"Unsupported transcription engine: {engine}")
+
+
 def should_transcribe_input_directly(input_path: Path, audio_output: str | None) -> bool:
     return input_path.suffix.lower() == ".wav" and audio_output is None
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract audio from a media file and transcribe it with local whisper.cpp.",
+        description="Extract audio from a media file and transcribe it with a local ASR engine.",
     )
     parser.add_argument("input", nargs="?", help="Input video/audio file. Defaults to latest media in downloads/.")
     parser.add_argument("--downloads-dir", default=DEFAULT_DOWNLOAD_DIR, help="Directory used when input is omitted. Default: downloads")
     parser.add_argument("--audio-output", help="Output WAV path. Default: input stem plus _audio.wav")
     parser.add_argument("--text-output", help="Output transcript TXT path. Default: input stem plus _transcript.txt")
     parser.add_argument("--output-dir", help="Directory for default audio/transcript outputs. Default: input file directory")
+    parser.add_argument("--engine", choices=TRANSCRIBE_ENGINES, default=DEFAULT_TRANSCRIBE_ENGINE, help=f"Transcription engine. Default: {DEFAULT_TRANSCRIBE_ENGINE}")
     parser.add_argument("--whisper-bin", help="Path or executable name for whisper.cpp whisper-cli.")
     parser.add_argument("--model", help="Path to a whisper.cpp ggml model.")
     parser.add_argument("--language", default=DEFAULT_LANGUAGE, help="Spoken language, or auto. Default: auto")
@@ -485,7 +643,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--extract-only", action="store_true", help="Only extract audio; do not run STT.")
     parser.add_argument("--reuse-audio", action="store_true", help="Reuse existing audio output instead of extracting again.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing audio/transcript outputs.")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Print ffmpeg and whisper.cpp commands.")
+    parser.add_argument("--funasr-model", default=DEFAULT_FUNASR_MODEL, help=f"FunASR model id or local path. Default: {DEFAULT_FUNASR_MODEL}")
+    parser.add_argument("--funasr-device", default=DEFAULT_FUNASR_DEVICE, help=f"FunASR device. Default: {DEFAULT_FUNASR_DEVICE}")
+    parser.add_argument("--funasr-vad-model", default=DEFAULT_FUNASR_VAD_MODEL, help=f"FunASR VAD model, or none/off. Default: {DEFAULT_FUNASR_VAD_MODEL}")
+    parser.add_argument("--funasr-punc-model", default=DEFAULT_FUNASR_PUNC_MODEL, help="Optional FunASR punctuation model, or none/off. Default: none")
+    parser.add_argument("--funasr-batch-size-s", type=int, default=DEFAULT_FUNASR_BATCH_SIZE_S, help=f"FunASR batch duration in seconds. Default: {DEFAULT_FUNASR_BATCH_SIZE_S}")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print ffmpeg command and ASR command/config details.")
     return parser.parse_args(argv)
 
 
@@ -518,13 +681,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.extract_only:
             return 0
 
-        whisper_bin = find_whisper_binary(args.whisper_bin)
-        model_path = find_whisper_model(args.model)
-        transcript = transcribe_audio(
+        whisper_bin = find_whisper_binary(args.whisper_bin) if args.engine == "whisper" else None
+        model_path = find_whisper_model(args.model) if args.engine == "whisper" else None
+        transcript = transcribe_audio_with_engine(
             saved_audio,
             transcript_path,
+            engine=args.engine,
             whisper_bin=whisper_bin,
-            model_path=model_path,
+            whisper_model_path=model_path,
             language=args.language,
             threads=args.threads,
             translate=args.translate,
@@ -532,6 +696,11 @@ def main(argv: list[str] | None = None) -> int:
             no_timestamps=not args.timestamps,
             print_progress=args.progress,
             fast=args.fast,
+            funasr_model=args.funasr_model,
+            funasr_device=args.funasr_device,
+            funasr_vad_model=args.funasr_vad_model,
+            funasr_punc_model=args.funasr_punc_model,
+            funasr_batch_size_s=args.funasr_batch_size_s,
             overwrite=args.overwrite,
             verbose=args.verbose,
         )

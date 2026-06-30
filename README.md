@@ -164,7 +164,7 @@ python3 x_transcoder.py downloads/input.mp4
 
 ## 本机语音转文字
 
-`video_transcriber.py` 会先用 `ffmpeg` 从视频里拆出单独的 16 kHz 单声道 WAV 音频，再调用本机 `whisper.cpp` 生成文字稿。
+`video_transcriber.py` 会先用 `ffmpeg` 从视频里拆出单独的 16 kHz 单声道 WAV 音频，再调用本机 ASR 引擎生成文字稿。默认引擎是已有的 `whisper.cpp`；也可以切到 FunASR。
 
 主下载器默认只下载视频。只有显式加参数时，才会在同一次运行里下载视频后继续拆音频或转文字。
 
@@ -200,6 +200,26 @@ python3 media_downloader.py --transcribe --whisper-no-progress "https://v.douyin
 python3 media_downloader.py --transcribe --whisper-fast "https://v.douyin.com/xxxx/"
 ```
 
+如果要使用 FunASR，本机当前是 CPU 环境，默认配置为 `iic/SenseVoiceSmall`、`cpu`、`fsmn-vad`。系统 Python 是受管环境，建议先建虚拟环境安装依赖：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -U pip
+python -m pip install funasr modelscope torch torchaudio
+```
+
+安装后可以选择 FunASR 转写：
+
+```bash
+python media_downloader.py \
+  --transcribe \
+  --transcribe-engine funasr \
+  --funasr-model iic/SenseVoiceSmall \
+  --funasr-device cpu \
+  "https://v.douyin.com/xxxx/"
+```
+
 音频和文字输出路径使用独立参数：
 
 ```bash
@@ -229,6 +249,9 @@ python3 media_downloader.py --interactive --transcribe
 交互模式中可以临时调节转写参数：
 
 ```text
+:transcribe-engine funasr
+:funasr-model iic/SenseVoiceSmall
+:funasr-device cpu
 :whisper-progress off
 :whisper-threads 8
 :whisper-fast on
@@ -271,6 +294,12 @@ python3 video_transcriber.py downloads/input_audio.wav
 python3 video_transcriber.py --threads 8 downloads/input.mp4
 python3 video_transcriber.py --fast downloads/input.mp4
 python3 video_transcriber.py --no-progress downloads/input.mp4
+```
+
+单独处理本地文件时也可以选择 FunASR：
+
+```bash
+python video_transcriber.py --engine funasr downloads/input.mp4
 ```
 
 默认会输出：
@@ -337,7 +366,7 @@ python3 media_downloader.py --cookie cookies.txt "https://v.douyin.com/xxxx/"
 
 `--x-compatible` 和 `x_transcoder.py` 需要系统安装 `ffmpeg` 和 `ffprobe`。不加 `--x-compatible` 时，主下载脚本不会执行 X 兼容检查或转码。
 
-`video_transcriber.py` 需要系统安装 `ffmpeg`，并需要可用的本机 `whisper.cpp` 可执行文件和 ggml 模型。
+`video_transcriber.py` 需要系统安装 `ffmpeg`。默认 `whisper` 引擎需要可用的本机 `whisper.cpp` 可执行文件和 ggml 模型；`funasr` 引擎需要在当前 Python 环境安装 `funasr`、`modelscope`、`torch`、`torchaudio`。
 
 ## 说明
 
