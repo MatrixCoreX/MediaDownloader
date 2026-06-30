@@ -253,13 +253,13 @@ class VideoTranscriberTests(unittest.TestCase):
         self.assertEqual(vt.extract_funasr_text({"text": "hello"}), "hello")
         self.assertEqual(vt.extract_funasr_text([{"text": "hello"}, {"text": "world"}]), "hello\nworld")
 
-    def test_postprocess_funasr_text_uses_rich_postprocess_when_available(self) -> None:
+    def test_postprocess_funasr_text_filters_rich_markers_by_default(self) -> None:
         fake_funasr = types.ModuleType("funasr")
         fake_funasr.__path__ = []  # type: ignore[attr-defined]
         fake_utils = types.ModuleType("funasr.utils")
         fake_utils.__path__ = []  # type: ignore[attr-defined]
         fake_postprocess = types.ModuleType("funasr.utils.postprocess_utils")
-        fake_postprocess.rich_transcription_postprocess = lambda text: "处理后文本"  # type: ignore[attr-defined]
+        fake_postprocess.rich_transcription_postprocess = lambda text: "\U0001f3bc处理后文本\U0001f60a"  # type: ignore[attr-defined]
 
         modules = {
             "funasr": fake_funasr,
@@ -268,6 +268,10 @@ class VideoTranscriberTests(unittest.TestCase):
         }
         with mock.patch.dict("sys.modules", modules):
             self.assertEqual(vt.postprocess_funasr_text("<|zh|>原始文本"), "处理后文本")
+            self.assertEqual(
+                vt.postprocess_funasr_text("<|zh|>原始文本", rich_text=True),
+                "\U0001f3bc处理后文本\U0001f60a",
+            )
 
     def test_transcribe_audio_with_funasr_writes_text(self) -> None:
         calls: dict[str, object] = {}
@@ -286,7 +290,7 @@ class VideoTranscriberTests(unittest.TestCase):
         fake_utils = types.ModuleType("funasr.utils")
         fake_utils.__path__ = []  # type: ignore[attr-defined]
         fake_postprocess = types.ModuleType("funasr.utils.postprocess_utils")
-        fake_postprocess.rich_transcription_postprocess = lambda text: text.replace("你好", "您好")  # type: ignore[attr-defined]
+        fake_postprocess.rich_transcription_postprocess = lambda text: text.replace("你好", "您好") + "\U0001f60a"  # type: ignore[attr-defined]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             audio_path = Path(tmpdir) / "video_audio.wav"

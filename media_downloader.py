@@ -1832,6 +1832,7 @@ def extract_audio_and_transcribe_if_needed(path: Path, args: argparse.Namespace)
             funasr_vad_model=args.funasr_vad_model,
             funasr_punc_model=args.funasr_punc_model,
             funasr_batch_size_s=args.funasr_batch_size_s,
+            funasr_rich_text=args.funasr_rich_text,
             overwrite=args.overwrite,
             verbose=args.verbose,
         )
@@ -2094,6 +2095,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=f"FunASR batch duration in seconds. Default: {video_transcriber.DEFAULT_FUNASR_BATCH_SIZE_S}",
     )
     parser.add_argument(
+        "--funasr-rich-text",
+        action="store_true",
+        default=video_transcriber.DEFAULT_FUNASR_RICH_TEXT,
+        help="Keep SenseVoice rich transcription emoji for emotion and audio events. Default: off",
+    )
+    parser.add_argument(
         "--x-compatible",
         action="store_true",
         default=False,
@@ -2227,6 +2234,7 @@ INTERACTIVE_BOOL_OPTIONS = {
     "transcribe": "transcribe",
     "stt": "transcribe",
     "verbose": "verbose",
+    "funasr-rich-text": "funasr_rich_text",
     "whisper-fast": "whisper_fast",
     "whisper-no-gpu": "whisper_no_gpu",
     "whisper-progress": "whisper_progress",
@@ -2240,6 +2248,7 @@ INTERACTIVE_BOOL_OPTIONS = {
 
 INTERACTIVE_BOOL_DEFAULTS = {
     "browser-fallback": True,
+    "funasr-rich-text": video_transcriber.DEFAULT_FUNASR_RICH_TEXT,
     "whisper-progress": True,
 }
 
@@ -2285,6 +2294,7 @@ INTERACTIVE_STATUS_OPTIONS = [
     "audio-output",
     "text-output",
     "transcribe-engine",
+    "funasr-rich-text",
     "funasr-model",
     "funasr-device",
     "funasr-vad-model",
@@ -2465,6 +2475,7 @@ def print_interactive_help() -> None:
                         "show-info",
                         "transcribe",
                         "verbose",
+                        "funasr-rich-text",
                         "whisper-fast",
                         "whisper-no-gpu",
                         "whisper-progress",

@@ -220,6 +220,12 @@ python media_downloader.py \
   "https://v.douyin.com/xxxx/"
 ```
 
+FunASR 使用 SenseVoice 时默认输出纯文字，会过滤情绪和声音事件 emoji。如果想保留这些富文本标记，例如背景音乐、笑声、情绪判断，可以加：
+
+```bash
+python media_downloader.py --transcribe --transcribe-engine funasr --funasr-rich-text "https://v.douyin.com/xxxx/"
+```
+
 音频和文字输出路径使用独立参数：
 
 ```bash
@@ -252,6 +258,7 @@ python3 media_downloader.py --interactive --transcribe
 :transcribe-engine funasr
 :funasr-model iic/SenseVoiceSmall
 :funasr-device cpu
+:funasr-rich-text on
 :whisper-progress off
 :whisper-threads 8
 :whisper-fast on
@@ -301,6 +308,8 @@ python3 video_transcriber.py --no-progress downloads/input.mp4
 ```bash
 python video_transcriber.py --engine funasr downloads/input.mp4
 ```
+
+默认会过滤 SenseVoice 富文本 emoji；需要保留时加 `--funasr-rich-text`。
 
 默认会输出：
 

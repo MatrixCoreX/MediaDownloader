@@ -191,6 +191,8 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertTrue(dd.parse_args(["--transcribe"]).transcribe)
         self.assertEqual(dd.parse_args([]).transcribe_engine, dd.video_transcriber.DEFAULT_TRANSCRIBE_ENGINE)
         self.assertEqual(dd.parse_args(["--transcribe-engine", "funasr"]).transcribe_engine, "funasr")
+        self.assertFalse(dd.parse_args([]).funasr_rich_text)
+        self.assertTrue(dd.parse_args(["--funasr-rich-text"]).funasr_rich_text)
 
     def test_browser_fallback_is_enabled_by_default(self) -> None:
         self.assertTrue(dd.parse_args([]).browser_fallback)
@@ -293,6 +295,14 @@ class DouyinDownloaderTests(unittest.TestCase):
             keep_running, cookie = dd.handle_interactive_command(args, ":funasr-device cpu", cookie)
             self.assertTrue(keep_running)
             self.assertEqual(args.funasr_device, "cpu")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":funasr-rich-text on", cookie)
+            self.assertTrue(keep_running)
+            self.assertTrue(args.funasr_rich_text)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":clear funasr-rich-text", cookie)
+            self.assertTrue(keep_running)
+            self.assertFalse(args.funasr_rich_text)
 
             keep_running, cookie = dd.handle_interactive_command(args, ":clear transcribe-engine", cookie)
             self.assertTrue(keep_running)
@@ -437,8 +447,10 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertIn(":transcribe ", dd.interactive_completion_candidates(":tr", 1, 3))
         self.assertIn("whisper-model ", dd.interactive_completion_candidates(":set whi", 5, 8))
         self.assertIn("funasr-model ", dd.interactive_completion_candidates(":set fun", 5, 8))
+        self.assertIn("funasr-rich-text ", dd.interactive_completion_candidates(":set fun", 5, 8))
         self.assertIn("douyin ", dd.interactive_completion_candidates(":set platform d", 14, 15))
         self.assertIn("funasr ", dd.interactive_completion_candidates(":set transcribe-engine f", 23, 24))
+        self.assertIn("on ", dd.interactive_completion_candidates(":set funasr-rich-text o", 22, 23))
         self.assertIn("off ", dd.interactive_completion_candidates(":transcribe o", 12, 13))
 
     def test_interactive_completion_is_registered_with_readline(self) -> None:
@@ -653,6 +665,7 @@ class DouyinDownloaderTests(unittest.TestCase):
                     "iic/SenseVoiceSmall",
                     "--funasr-device",
                     "cpu",
+                    "--funasr-rich-text",
                     "https://v.douyin.com/abc123/",
                 ]
             )
@@ -681,6 +694,7 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertEqual(transcribe.call_args.kwargs["engine"], "funasr")
         self.assertEqual(transcribe.call_args.kwargs["funasr_model"], "iic/SenseVoiceSmall")
         self.assertEqual(transcribe.call_args.kwargs["funasr_device"], "cpu")
+        self.assertTrue(transcribe.call_args.kwargs["funasr_rich_text"])
 
     def test_handle_share_text_extract_audio_does_not_transcribe_without_flag(self) -> None:
         args = dd.parse_args(["--extract-audio", "https://v.douyin.com/abc123/"])

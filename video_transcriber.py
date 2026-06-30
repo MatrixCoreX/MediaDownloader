@@ -29,7 +29,26 @@ DEFAULT_FUNASR_DEVICE = "cpu"
 DEFAULT_FUNASR_VAD_MODEL = "fsmn-vad"
 DEFAULT_FUNASR_PUNC_MODEL = None
 DEFAULT_FUNASR_BATCH_SIZE_S = 60
+DEFAULT_FUNASR_RICH_TEXT = False
 FUNASR_RICH_TAG_RE = re.compile(r"<\|[^|>]+?\|>")
+FUNASR_RICH_MARKER_RE = re.compile(
+    "["
+    "\U0001f600"
+    "\U0001f604"
+    "\U0001f60a"
+    "\U0001f614"
+    "\U0001f621"
+    "\U0001f630"
+    "\U0001f62e"
+    "\U0001f922"
+    "\U0001f927"
+    "\U0001f62d"
+    "\U0001f637"
+    "\U0001f3bc"
+    "\U0001f44f"
+    "\u2753"
+    "]"
+)
 MEDIA_EXTENSIONS = {
     ".mp4",
     ".mov",
@@ -490,7 +509,11 @@ def extract_funasr_text(result: object) -> str:
     return ""
 
 
-def postprocess_funasr_text(text: str) -> str:
+def strip_funasr_rich_markers(text: str) -> str:
+    return FUNASR_RICH_MARKER_RE.sub("", text).strip()
+
+
+def postprocess_funasr_text(text: str, *, rich_text: bool = DEFAULT_FUNASR_RICH_TEXT) -> str:
     try:
         from funasr.utils.postprocess_utils import rich_transcription_postprocess
     except ImportError:
@@ -500,7 +523,10 @@ def postprocess_funasr_text(text: str) -> str:
             processed = rich_transcription_postprocess(text)
         except Exception:
             processed = text
-    return FUNASR_RICH_TAG_RE.sub("", processed).strip()
+    processed = FUNASR_RICH_TAG_RE.sub("", processed).strip()
+    if not rich_text:
+        processed = strip_funasr_rich_markers(processed)
+    return processed
 
 
 def transcribe_audio_with_funasr(
@@ -512,6 +538,7 @@ def transcribe_audio_with_funasr(
     vad_model: str | None = DEFAULT_FUNASR_VAD_MODEL,
     punc_model: str | None = DEFAULT_FUNASR_PUNC_MODEL,
     batch_size_s: int = DEFAULT_FUNASR_BATCH_SIZE_S,
+    rich_text: bool = DEFAULT_FUNASR_RICH_TEXT,
     overwrite: bool = False,
     verbose: bool = False,
 ) -> Path:
@@ -550,7 +577,7 @@ def transcribe_audio_with_funasr(
     except Exception as exc:
         raise VideoTranscribeError(f"FunASR failed: {exc}") from exc
 
-    text = postprocess_funasr_text(extract_funasr_text(result))
+    text = postprocess_funasr_text(extract_funasr_text(result), rich_text=rich_text)
     if not text:
         raise VideoTranscribeError("FunASR completed but returned no transcript text")
     transcript_path.write_text(text + "\n", encoding="utf-8")
@@ -576,6 +603,7 @@ def transcribe_audio_with_engine(
     funasr_vad_model: str | None = DEFAULT_FUNASR_VAD_MODEL,
     funasr_punc_model: str | None = DEFAULT_FUNASR_PUNC_MODEL,
     funasr_batch_size_s: int = DEFAULT_FUNASR_BATCH_SIZE_S,
+    funasr_rich_text: bool = DEFAULT_FUNASR_RICH_TEXT,
     overwrite: bool = False,
     verbose: bool = False,
 ) -> Path:
@@ -609,6 +637,7 @@ def transcribe_audio_with_engine(
             vad_model=funasr_vad_model,
             punc_model=funasr_punc_model,
             batch_size_s=funasr_batch_size_s,
+            rich_text=funasr_rich_text,
             overwrite=overwrite,
             verbose=verbose,
         )
@@ -648,6 +677,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--funasr-vad-model", default=DEFAULT_FUNASR_VAD_MODEL, help=f"FunASR VAD model, or none/off. Default: {DEFAULT_FUNASR_VAD_MODEL}")
     parser.add_argument("--funasr-punc-model", default=DEFAULT_FUNASR_PUNC_MODEL, help="Optional FunASR punctuation model, or none/off. Default: none")
     parser.add_argument("--funasr-batch-size-s", type=int, default=DEFAULT_FUNASR_BATCH_SIZE_S, help=f"FunASR batch duration in seconds. Default: {DEFAULT_FUNASR_BATCH_SIZE_S}")
+    parser.add_argument("--funasr-rich-text", action="store_true", default=DEFAULT_FUNASR_RICH_TEXT, help="Keep SenseVoice rich transcription emoji for emotion and audio events. Default: off")
     parser.add_argument("-v", "--verbose", action="store_true", help="Print ffmpeg command and ASR command/config details.")
     return parser.parse_args(argv)
 
@@ -701,6 +731,7 @@ def main(argv: list[str] | None = None) -> int:
             funasr_vad_model=args.funasr_vad_model,
             funasr_punc_model=args.funasr_punc_model,
             funasr_batch_size_s=args.funasr_batch_size_s,
+            funasr_rich_text=args.funasr_rich_text,
             overwrite=args.overwrite,
             verbose=args.verbose,
         )
