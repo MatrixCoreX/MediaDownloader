@@ -295,9 +295,25 @@ class DouyinDownloaderTests(unittest.TestCase):
             self.assertTrue(keep_running)
             self.assertFalse(args.whisper_progress)
 
+            keep_running, cookie = dd.handle_interactive_command(args, ":clear whisper-progress", cookie)
+            self.assertTrue(keep_running)
+            self.assertTrue(args.whisper_progress)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":browser-fallback off", cookie)
+            self.assertTrue(keep_running)
+            self.assertFalse(args.browser_fallback)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":clear browser-fallback", cookie)
+            self.assertTrue(keep_running)
+            self.assertTrue(args.browser_fallback)
+
             keep_running, cookie = dd.handle_interactive_command(args, ":whisper-fast on", cookie)
             self.assertTrue(keep_running)
             self.assertTrue(args.whisper_fast)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":clear whisper-fast", cookie)
+            self.assertTrue(keep_running)
+            self.assertFalse(args.whisper_fast)
 
     def test_interactive_status_prints_current_settings(self) -> None:
         args = dd.parse_args(["--interactive", "--transcribe", "--output-dir", "videos"])
@@ -628,6 +644,39 @@ class DouyinDownloaderTests(unittest.TestCase):
 
         extract_audio.assert_called_once()
         transcribe_audio.assert_not_called()
+
+    def test_handle_share_text_reuses_existing_default_audio_for_transcription(self) -> None:
+        args = dd.parse_args(["--transcribe", "https://v.douyin.com/abc123/"])
+        candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_path = Path(tmpdir) / "video.mp4"
+            audio_path = Path(tmpdir) / "video_audio.wav"
+            transcript_path = Path(tmpdir) / "video_transcript.txt"
+            saved_path.write_text("video", encoding="utf-8")
+            audio_path.write_text("audio", encoding="utf-8")
+            with mock.patch(
+                "media_downloader.gather_candidates_for_request",
+                return_value=("douyin", "7441234567890123456", [candidate], [], []),
+            ), mock.patch("media_downloader.download_candidate", return_value=saved_path), mock.patch(
+                "media_downloader.video_transcriber.extract_audio",
+                return_value=audio_path,
+            ) as extract_audio, mock.patch(
+                "media_downloader.video_transcriber.find_whisper_binary",
+                return_value=Path("/bin/whisper-cli"),
+            ), mock.patch(
+                "media_downloader.video_transcriber.find_whisper_model",
+                return_value=Path("/models/ggml-small.bin"),
+            ), mock.patch(
+                "media_downloader.video_transcriber.transcribe_audio",
+                return_value=transcript_path,
+            ):
+                with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                    "sys.stderr",
+                    new_callable=io.StringIO,
+                ):
+                    self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        self.assertTrue(extract_audio.call_args.kwargs["reuse_audio"])
 
     def test_audio_options_are_ignored_for_image_only_posts(self) -> None:
         args = dd.parse_args(["--transcribe", "https://www.xiaohongshu.com/discovery/item/abc"])

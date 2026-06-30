@@ -67,6 +67,9 @@ def latest_media(directory: Path) -> Path:
         for path in directory.iterdir()
         if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS
     ]
+    preferred_candidates = [path for path in candidates if not is_generated_audio_output(path)]
+    if preferred_candidates:
+        candidates = preferred_candidates
     if not candidates:
         raise VideoTranscribeError(f"No media files found in {directory}")
     return max(candidates, key=lambda path: path.stat().st_mtime)
@@ -205,6 +208,31 @@ def output_path_for(
     return parent / f"{input_path.stem}{suffix}{extension}"
 
 
+def is_generated_audio_output(path: Path) -> bool:
+    if path.suffix.lower() != ".wav" or not path.stem.endswith(DEFAULT_AUDIO_SUFFIX):
+        return False
+    source_stem = path.stem[: -len(DEFAULT_AUDIO_SUFFIX)]
+    if not source_stem:
+        return False
+    return any((path.parent / f"{source_stem}{extension}").exists() for extension in MEDIA_EXTENSIONS)
+
+
+def transcript_stem_for(input_path: Path) -> str:
+    stem = input_path.stem
+    if input_path.suffix.lower() == ".wav" and stem.endswith(DEFAULT_AUDIO_SUFFIX):
+        stripped = stem[: -len(DEFAULT_AUDIO_SUFFIX)]
+        if stripped:
+            return stripped
+    return stem
+
+
+def transcript_output_path_for(input_path: Path, output: str | None, output_dir: str | None) -> Path:
+    if output:
+        return output_path_for(input_path, output, output_dir, DEFAULT_TRANSCRIPT_SUFFIX, ".txt")
+    parent = Path(output_dir).expanduser() if output_dir else input_path.parent
+    return parent / f"{transcript_stem_for(input_path)}{DEFAULT_TRANSCRIPT_SUFFIX}.txt"
+
+
 def transcript_prefix_for(transcript_path: Path) -> Path:
     if transcript_path.suffix.lower() == ".txt":
         return transcript_path.with_suffix("")
@@ -245,10 +273,24 @@ def render_progress_bar(percent: int, *, width: int = 30) -> str:
     return f"transcribe_progress: [{'#' * filled}{'.' * (width - filled)}] {clamped:3d}%"
 
 
+def print_progress_bar(percent: int, *, interactive: bool) -> None:
+    line = render_progress_bar(percent)
+    if interactive:
+        print(f"\r{line}", end="", file=sys.stderr, flush=True)
+        return
+    print(line, file=sys.stderr, flush=True)
+
+
+def finish_progress_bar(*, interactive: bool) -> None:
+    if interactive:
+        print(file=sys.stderr, flush=True)
+
+
 def run_streaming_command(command: list[str], *, verbose: bool) -> subprocess.CompletedProcess[str]:
     output_parts: list[str] = []
-    last_progress = -1
-    print(render_progress_bar(0), file=sys.stderr, flush=True)
+    last_progress = 0
+    interactive_progress = sys.stderr.isatty()
+    print_progress_bar(0, interactive=interactive_progress)
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -263,7 +305,7 @@ def run_streaming_command(command: list[str], *, verbose: bool) -> subprocess.Co
         if match:
             progress = max(0, min(int(match.group(1)), 100))
             if progress != last_progress:
-                print(render_progress_bar(progress), file=sys.stderr, flush=True)
+                print_progress_bar(progress, interactive=interactive_progress)
                 last_progress = progress
             continue
         if verbose:
@@ -271,7 +313,8 @@ def run_streaming_command(command: list[str], *, verbose: bool) -> subprocess.Co
 
     returncode = process.wait()
     if returncode == 0 and last_progress < 100:
-        print(render_progress_bar(100), file=sys.stderr, flush=True)
+        print_progress_bar(100, interactive=interactive_progress)
+    finish_progress_bar(interactive=interactive_progress)
     return subprocess.CompletedProcess(command, returncode, "", "".join(output_parts))
 
 
@@ -415,6 +458,10 @@ def transcribe_audio(
     return transcript_path
 
 
+def should_transcribe_input_directly(input_path: Path, audio_output: str | None) -> bool:
+    return input_path.suffix.lower() == ".wav" and audio_output is None
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Extract audio from a media file and transcribe it with local whisper.cpp.",
@@ -447,22 +494,26 @@ def main(argv: list[str] | None = None) -> int:
     try:
         input_path = Path(args.input).expanduser() if args.input else latest_media(Path(args.downloads_dir).expanduser())
         audio_path = output_path_for(input_path, args.audio_output, args.output_dir, DEFAULT_AUDIO_SUFFIX, ".wav")
-        transcript_path = output_path_for(
+        transcript_path = transcript_output_path_for(
             input_path,
             args.text_output,
             args.output_dir,
-            DEFAULT_TRANSCRIPT_SUFFIX,
-            ".txt",
         )
-        saved_audio = extract_audio(
-            input_path,
-            audio_path,
-            overwrite=args.overwrite,
-            reuse_audio=args.reuse_audio,
-            sample_rate=args.sample_rate,
-            channels=args.channels,
-            verbose=args.verbose,
-        )
+        if should_transcribe_input_directly(input_path, args.audio_output):
+            if not input_path.exists():
+                raise VideoTranscribeError(f"Input file does not exist: {input_path}")
+            saved_audio = input_path
+        else:
+            auto_reuse_audio = not args.extract_only and args.audio_output is None and audio_path.exists()
+            saved_audio = extract_audio(
+                input_path,
+                audio_path,
+                overwrite=args.overwrite,
+                reuse_audio=args.reuse_audio or auto_reuse_audio,
+                sample_rate=args.sample_rate,
+                channels=args.channels,
+                verbose=args.verbose,
+            )
         print(f"audio: {saved_audio}")
         if args.extract_only:
             return 0

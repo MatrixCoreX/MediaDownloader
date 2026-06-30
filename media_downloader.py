@@ -1778,10 +1778,12 @@ def extract_audio_and_transcribe_if_needed(path: Path, args: argparse.Namespace)
         ".wav",
     )
     try:
+        reuse_audio = bool(args.transcribe and args.audio_output is None and audio_path.exists())
         saved_audio = video_transcriber.extract_audio(
             path,
             audio_path,
             overwrite=args.overwrite,
+            reuse_audio=reuse_audio,
             sample_rate=args.audio_sample_rate,
             channels=args.audio_channels,
             verbose=args.verbose,
@@ -2189,6 +2191,11 @@ INTERACTIVE_BOOL_OPTIONS = {
     "x-overwrite": "x_overwrite",
 }
 
+INTERACTIVE_BOOL_DEFAULTS = {
+    "browser-fallback": True,
+    "whisper-progress": True,
+}
+
 INTERACTIVE_VALUE_OPTIONS = {
     "audio-channels": ("audio_channels", int, video_transcriber.DEFAULT_CHANNELS),
     "audio-output": ("audio_output", str, None),
@@ -2472,7 +2479,7 @@ def set_interactive_option(
 def clear_interactive_option(args: argparse.Namespace, key: str, cookie: str | None) -> str | None:
     normalized = interactive_option_key(key)
     if normalized in INTERACTIVE_BOOL_OPTIONS:
-        setattr(args, INTERACTIVE_BOOL_OPTIONS[normalized], False)
+        setattr(args, INTERACTIVE_BOOL_OPTIONS[normalized], INTERACTIVE_BOOL_DEFAULTS.get(normalized, False))
         print_interactive_setting(args, normalized)
         return cookie
     if normalized not in INTERACTIVE_VALUE_OPTIONS:

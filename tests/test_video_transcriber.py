@@ -1,3 +1,4 @@
+import io
 import os
 import subprocess
 import tempfile
@@ -24,6 +25,18 @@ class VideoTranscriberTests(unittest.TestCase):
 
             self.assertEqual(vt.latest_media(directory), newer)
 
+    def test_latest_media_prefers_source_video_over_generated_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            video = directory / "clip.mp4"
+            generated_audio = directory / "clip_audio.wav"
+            video.write_text("video", encoding="utf-8")
+            generated_audio.write_text("audio", encoding="utf-8")
+            os.utime(video, (100, 100))
+            os.utime(generated_audio, (200, 200))
+
+            self.assertEqual(vt.latest_media(directory), video)
+
     def test_output_paths_add_expected_suffixes(self) -> None:
         input_path = Path("downloads/video.mp4")
 
@@ -39,6 +52,10 @@ class VideoTranscriberTests(unittest.TestCase):
             vt.output_path_for(input_path, "custom", None, vt.DEFAULT_AUDIO_SUFFIX, ".wav"),
             Path("custom.wav"),
         )
+        self.assertEqual(
+            vt.transcript_output_path_for(Path("downloads/video_audio.wav"), None, None),
+            Path("downloads/video_transcript.txt"),
+        )
 
     def test_default_whisper_threads_uses_cpu_count_with_cap(self) -> None:
         with mock.patch("video_transcriber.os.cpu_count", return_value=32):
@@ -52,6 +69,24 @@ class VideoTranscriberTests(unittest.TestCase):
         self.assertIn("  0%", vt.render_progress_bar(-10))
         self.assertIn("100%", vt.render_progress_bar(3030))
         self.assertIn("[###############...............]", vt.render_progress_bar(50))
+
+    def test_print_progress_bar_overwrites_line_for_tty(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("video_transcriber.sys.stderr", stderr):
+            vt.print_progress_bar(25, interactive=True)
+            vt.finish_progress_bar(interactive=True)
+
+        self.assertTrue(stderr.getvalue().startswith("\rtranscribe_progress:"))
+        self.assertTrue(stderr.getvalue().endswith("\n"))
+
+    def test_print_progress_bar_uses_newlines_for_non_tty(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch("video_transcriber.sys.stderr", stderr):
+            vt.print_progress_bar(25, interactive=False)
+            vt.print_progress_bar(50, interactive=False)
+
+        self.assertNotIn("\r", stderr.getvalue())
+        self.assertEqual(len(stderr.getvalue().splitlines()), 2)
 
     def test_build_extract_audio_command_uses_whisper_friendly_wav(self) -> None:
         command = vt.build_extract_audio_command(
@@ -211,6 +246,50 @@ class VideoTranscriberTests(unittest.TestCase):
                     ),
                     transcript_path,
                 )
+
+    def test_main_transcribes_wav_input_directly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            audio_path = Path(tmpdir) / "video_audio.wav"
+            transcript_path = Path(tmpdir) / "video_transcript.txt"
+            audio_path.write_text("audio", encoding="utf-8")
+            with mock.patch("video_transcriber.extract_audio") as extract_audio, mock.patch(
+                "video_transcriber.find_whisper_binary",
+                return_value=Path("/bin/whisper-cli"),
+            ), mock.patch(
+                "video_transcriber.find_whisper_model",
+                return_value=Path("ggml-small.bin"),
+            ), mock.patch(
+                "video_transcriber.transcribe_audio",
+                return_value=transcript_path,
+            ) as transcribe_audio, mock.patch("sys.stdout"):
+                self.assertEqual(vt.main([str(audio_path)]), 0)
+
+            extract_audio.assert_not_called()
+            self.assertEqual(transcribe_audio.call_args.args[:2], (audio_path, transcript_path))
+
+    def test_main_reuses_existing_default_audio_when_transcribing_video(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "video.mp4"
+            audio_path = Path(tmpdir) / "video_audio.wav"
+            transcript_path = Path(tmpdir) / "video_transcript.txt"
+            video_path.write_text("video", encoding="utf-8")
+            audio_path.write_text("audio", encoding="utf-8")
+            with mock.patch(
+                "video_transcriber.extract_audio",
+                return_value=audio_path,
+            ) as extract_audio, mock.patch(
+                "video_transcriber.find_whisper_binary",
+                return_value=Path("/bin/whisper-cli"),
+            ), mock.patch(
+                "video_transcriber.find_whisper_model",
+                return_value=Path("ggml-small.bin"),
+            ), mock.patch(
+                "video_transcriber.transcribe_audio",
+                return_value=transcript_path,
+            ), mock.patch("sys.stdout"):
+                self.assertEqual(vt.main([str(video_path)]), 0)
+
+            self.assertTrue(extract_audio.call_args.kwargs["reuse_audio"])
 
 
 if __name__ == "__main__":

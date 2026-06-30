@@ -85,6 +85,8 @@ python3 media_downloader.py --interactive
 
 布尔参数也支持快捷写法，例如 `:transcribe on`、`:extract-audio off`、`:x-compatible toggle`。路径、平台、超时、whisper 模型等参数支持 `:set 参数名 值`；输入 `:status` 可以查看当前配置。
 
+`:extract-audio off` 只关闭“单独拆 WAV”功能，不会自动关闭转文字；如果 `:transcribe on` 仍然开启，下载后仍会生成或复用中间 WAV 并继续转文字。要停止转文字，需要执行 `:transcribe off`。`:clear audio-output` 只是清除自定义音频路径，恢复默认 `_audio.wav` 路径。
+
 手动指定平台：
 
 ```bash
@@ -222,6 +224,8 @@ downloads/20260624_153012_transcript.txt
 python3 media_downloader.py --interactive --transcribe
 ```
 
+如果已经进入交互模式，也可以先输入 `:transcribe on` 再粘贴链接；只开 `:extract-audio` 会只生成 WAV，不会生成文字稿。反过来，关闭 `:extract-audio` 不会关闭转写；只要 `:transcribe on` 还开着，程序仍会为了转文字生成或复用中间 WAV。
+
 交互模式中可以临时调节转写参数：
 
 ```text
@@ -253,6 +257,12 @@ python3 video_transcriber.py
 
 ```bash
 python3 video_transcriber.py downloads/input.mp4
+```
+
+如果已经有 `downloads/input_audio.wav`，也可以直接转这个 WAV：
+
+```bash
+python3 video_transcriber.py downloads/input_audio.wav
 ```
 
 单独转写本地文件时同样默认打印进度，并自动选择线程数。可以用 `--threads` 调速，用 `--no-progress` 关闭进度输出；需要进一步提速时可以加 `--fast`。
