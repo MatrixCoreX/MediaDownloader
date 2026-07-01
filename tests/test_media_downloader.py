@@ -194,6 +194,17 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertFalse(dd.parse_args([]).funasr_rich_text)
         self.assertTrue(dd.parse_args(["--funasr-rich-text"]).funasr_rich_text)
 
+    def test_image_ocr_is_enabled_by_default(self) -> None:
+        self.assertTrue(dd.parse_args([]).ocr_images)
+        self.assertFalse(dd.parse_args(["--no-ocr-images"]).ocr_images)
+        self.assertTrue(dd.parse_args(["--ocr-images"]).ocr_images)
+        self.assertEqual(dd.parse_args([]).ocr_language, dd.image_ocr.DEFAULT_LANGUAGE)
+        self.assertEqual(dd.parse_args(["--ocr-language", "eng"]).ocr_language, "eng")
+        self.assertEqual(dd.parse_args([]).ocr_psm, dd.image_ocr.DEFAULT_PSM)
+        self.assertTrue(dd.parse_args([]).ocr_preprocess)
+        self.assertFalse(dd.parse_args(["--no-ocr-preprocess"]).ocr_preprocess)
+        self.assertTrue(dd.parse_args(["--ocr-preprocess"]).ocr_preprocess)
+
     def test_browser_fallback_is_enabled_by_default(self) -> None:
         self.assertTrue(dd.parse_args([]).browser_fallback)
         self.assertFalse(dd.parse_args(["--no-browser-fallback"]).browser_fallback)
@@ -332,6 +343,32 @@ class DouyinDownloaderTests(unittest.TestCase):
             self.assertTrue(keep_running)
             self.assertTrue(args.browser_fallback)
 
+            self.assertTrue(args.ocr_images)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":ocr-images off", cookie)
+            self.assertTrue(keep_running)
+            self.assertFalse(args.ocr_images)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":clear ocr-images", cookie)
+            self.assertTrue(keep_running)
+            self.assertTrue(args.ocr_images)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":ocr-language eng", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.ocr_language, "eng")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":clear ocr-language", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.ocr_language, dd.image_ocr.DEFAULT_LANGUAGE)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":ocr-preprocess off", cookie)
+            self.assertTrue(keep_running)
+            self.assertFalse(args.ocr_preprocess)
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":clear ocr-preprocess", cookie)
+            self.assertTrue(keep_running)
+            self.assertTrue(args.ocr_preprocess)
+
             keep_running, cookie = dd.handle_interactive_command(args, ":whisper-fast on", cookie)
             self.assertTrue(keep_running)
             self.assertTrue(args.whisper_fast)
@@ -448,6 +485,8 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertIn("whisper-model ", dd.interactive_completion_candidates(":set whi", 5, 8))
         self.assertIn("funasr-model ", dd.interactive_completion_candidates(":set fun", 5, 8))
         self.assertIn("funasr-rich-text ", dd.interactive_completion_candidates(":set fun", 5, 8))
+        self.assertIn("ocr-images ", dd.interactive_completion_candidates(":set ocr", 5, 8))
+        self.assertIn("ocr-preprocess ", dd.interactive_completion_candidates(":set ocr", 5, 8))
         self.assertIn("douyin ", dd.interactive_completion_candidates(":set platform d", 14, 15))
         self.assertIn("funasr ", dd.interactive_completion_candidates(":set transcribe-engine f", 23, 24))
         self.assertIn("on ", dd.interactive_completion_candidates(":set funasr-rich-text o", 22, 23))
@@ -754,7 +793,7 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertTrue(extract_audio.call_args.kwargs["reuse_audio"])
 
     def test_audio_options_are_ignored_for_image_only_posts(self) -> None:
-        args = dd.parse_args(["--transcribe", "https://www.xiaohongshu.com/discovery/item/abc"])
+        args = dd.parse_args(["--transcribe", "--no-ocr-images", "https://www.xiaohongshu.com/discovery/item/abc"])
         image_candidate = dd.ImageCandidate("https://example.com/image.jpg", "test", 1)
         saved_paths = [Path("downloads/image.jpg")]
         with mock.patch(
@@ -775,6 +814,104 @@ class DouyinDownloaderTests(unittest.TestCase):
         download_images.assert_called_once()
         extract_audio.assert_not_called()
         self.assertIn("downloads/image.jpg", stdout.getvalue())
+
+    def test_handle_share_text_ocr_images_by_default(self) -> None:
+        args = dd.parse_args(
+            [
+                "--ocr-language",
+                "eng",
+                "--ocr-output",
+                "downloads/post_text.txt",
+                "https://www.xiaohongshu.com/discovery/item/abc",
+            ]
+        )
+        image_candidate = dd.ImageCandidate("https://example.com/image.jpg", "test", 1)
+        saved_paths = [Path("downloads/image.jpg")]
+        ocr_path = Path("downloads/post_text.txt")
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("xiaohongshu", "abc", [], [image_candidate], []),
+        ), mock.patch(
+            "media_downloader.download_image_candidates",
+            return_value=saved_paths,
+        ), mock.patch(
+            "media_downloader.image_ocr.ocr_images",
+            return_value=ocr_path,
+        ) as ocr_images:
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ):
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        self.assertEqual(ocr_images.call_args.args[0], saved_paths)
+        self.assertEqual(ocr_images.call_args.kwargs["output"], "downloads/post_text.txt")
+        self.assertEqual(ocr_images.call_args.kwargs["language"], "eng")
+        self.assertEqual(ocr_images.call_args.kwargs["psm"], dd.image_ocr.DEFAULT_PSM)
+        self.assertTrue(ocr_images.call_args.kwargs["preprocess"])
+        self.assertIn(f"ocr: {ocr_path}", stdout.getvalue())
+
+    def test_no_ocr_images_disables_default_ocr(self) -> None:
+        args = dd.parse_args(["--no-ocr-images", "https://www.xiaohongshu.com/discovery/item/abc"])
+        image_candidate = dd.ImageCandidate("https://example.com/image.jpg", "test", 1)
+        saved_paths = [Path("downloads/image.jpg")]
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("xiaohongshu", "abc", [], [image_candidate], []),
+        ), mock.patch(
+            "media_downloader.download_image_candidates",
+            return_value=saved_paths,
+        ), mock.patch(
+            "media_downloader.image_ocr.ocr_images",
+        ) as ocr_images:
+            with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ):
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        ocr_images.assert_not_called()
+
+    def test_default_ocr_failure_does_not_fail_image_download(self) -> None:
+        args = dd.parse_args(["https://www.xiaohongshu.com/discovery/item/abc"])
+        image_candidate = dd.ImageCandidate("https://example.com/image.jpg", "test", 1)
+        saved_paths = [Path("downloads/image.jpg")]
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("xiaohongshu", "abc", [], [image_candidate], []),
+        ), mock.patch(
+            "media_downloader.download_image_candidates",
+            return_value=saved_paths,
+        ), mock.patch(
+            "media_downloader.image_ocr.ocr_images",
+            side_effect=dd.image_ocr.ImageOcrError("tesseract is required but was not found in PATH."),
+        ):
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        self.assertIn("downloads/image.jpg", stdout.getvalue())
+        self.assertIn("warning: Image OCR skipped", stderr.getvalue())
+
+    def test_print_url_does_not_run_default_ocr(self) -> None:
+        args = dd.parse_args(["--print-url", "https://www.xiaohongshu.com/discovery/item/abc"])
+        image_candidate = dd.ImageCandidate("https://example.com/image.jpg", "test", 1)
+        with mock.patch(
+            "media_downloader.gather_candidates_for_request",
+            return_value=("xiaohongshu", "abc", [], [image_candidate], []),
+        ), mock.patch(
+            "media_downloader.image_ocr.ocr_images",
+        ) as ocr_images:
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ):
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        ocr_images.assert_not_called()
+        self.assertIn("https://example.com/image.jpg", stdout.getvalue())
 
     def test_platform_defaults_to_auto(self) -> None:
         self.assertEqual(dd.parse_args([]).platform, "auto")

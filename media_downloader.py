@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import image_ocr
 import video_transcriber
 
 try:
@@ -1841,6 +1842,27 @@ def extract_audio_and_transcribe_if_needed(path: Path, args: argparse.Namespace)
     print(f"transcript: {transcript}")
 
 
+def ocr_images_if_needed(paths: list[Path], output_stem: str, args: argparse.Namespace) -> None:
+    if not args.ocr_images:
+        return
+    try:
+        ocr_path = image_ocr.ocr_images(
+            paths,
+            output=args.ocr_output,
+            output_stem=output_stem,
+            tesseract_bin=args.ocr_bin,
+            language=args.ocr_language,
+            psm=args.ocr_psm,
+            preprocess=args.ocr_preprocess,
+            overwrite=args.overwrite,
+            verbose=args.verbose,
+        )
+    except Exception as exc:
+        print(f"warning: Image OCR skipped: {exc}", file=sys.stderr)
+        return
+    print(f"ocr: {ocr_path}")
+
+
 def read_share_text(args: argparse.Namespace) -> str:
     if args.input_file:
         return Path(args.input_file).expanduser().read_text(encoding="utf-8")
@@ -1985,6 +2007,51 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--show-info",
         action="store_true",
         help="Print resolution, duration, codec, bitrate, and file size after download.",
+    )
+    ocr_group = parser.add_mutually_exclusive_group()
+    ocr_group.add_argument(
+        "--ocr-images",
+        action="store_true",
+        default=True,
+        help="After downloading image posts, run local OCR and save recognized text to a TXT file. Default: enabled",
+    )
+    ocr_group.add_argument(
+        "--no-ocr-images",
+        dest="ocr_images",
+        action="store_false",
+        help="Disable OCR after downloading image posts.",
+    )
+    parser.add_argument(
+        "--ocr-output",
+        help="Output TXT path for --ocr-images. Default: image output stem plus _ocr.txt",
+    )
+    parser.add_argument(
+        "--ocr-language",
+        default=image_ocr.DEFAULT_LANGUAGE,
+        help=f"Tesseract language list for --ocr-images. Default: {image_ocr.DEFAULT_LANGUAGE}",
+    )
+    parser.add_argument(
+        "--ocr-bin",
+        help="Path or executable name for tesseract used by --ocr-images.",
+    )
+    parser.add_argument(
+        "--ocr-psm",
+        type=int,
+        default=image_ocr.DEFAULT_PSM,
+        help=f"Tesseract page segmentation mode for --ocr-images. Default: {image_ocr.DEFAULT_PSM}",
+    )
+    ocr_preprocess_group = parser.add_mutually_exclusive_group()
+    ocr_preprocess_group.add_argument(
+        "--ocr-preprocess",
+        action="store_true",
+        default=image_ocr.DEFAULT_PREPROCESS,
+        help="Enhance images before OCR. Default: enabled",
+    )
+    ocr_preprocess_group.add_argument(
+        "--no-ocr-preprocess",
+        dest="ocr_preprocess",
+        action="store_false",
+        help="Disable image enhancement before OCR.",
     )
     parser.add_argument(
         "--extract-audio",
@@ -2231,6 +2298,9 @@ INTERACTIVE_BOOL_OPTIONS = {
     "print-url": "print_url",
     "save-meta": "save_meta",
     "show-info": "show_info",
+    "ocr-images": "ocr_images",
+    "ocr": "ocr_images",
+    "ocr-preprocess": "ocr_preprocess",
     "transcribe": "transcribe",
     "stt": "transcribe",
     "verbose": "verbose",
@@ -2249,6 +2319,9 @@ INTERACTIVE_BOOL_OPTIONS = {
 INTERACTIVE_BOOL_DEFAULTS = {
     "browser-fallback": True,
     "funasr-rich-text": video_transcriber.DEFAULT_FUNASR_RICH_TEXT,
+    "ocr": True,
+    "ocr-images": True,
+    "ocr-preprocess": image_ocr.DEFAULT_PREPROCESS,
     "whisper-progress": True,
 }
 
@@ -2266,6 +2339,10 @@ INTERACTIVE_VALUE_OPTIONS = {
     "funasr-vad-model": ("funasr_vad_model", str, video_transcriber.DEFAULT_FUNASR_VAD_MODEL),
     "output-dir": ("output_dir", str, "downloads"),
     "output-name": ("output_name", str, None),
+    "ocr-bin": ("ocr_bin", str, None),
+    "ocr-language": ("ocr_language", str, image_ocr.DEFAULT_LANGUAGE),
+    "ocr-output": ("ocr_output", str, None),
+    "ocr-psm": ("ocr_psm", int, image_ocr.DEFAULT_PSM),
     "platform": ("platform", str, "auto"),
     "text-output": ("text_output", str, None),
     "timeout": ("timeout", float, 20.0),
@@ -2285,6 +2362,12 @@ INTERACTIVE_STATUS_OPTIONS = [
     "print-url",
     "save-meta",
     "show-info",
+    "ocr-images",
+    "ocr-output",
+    "ocr-language",
+    "ocr-bin",
+    "ocr-psm",
+    "ocr-preprocess",
     "overwrite",
     "browser-fallback",
     "timeout",
@@ -2473,6 +2556,8 @@ def print_interactive_help() -> None:
                         "print-url",
                         "save-meta",
                         "show-info",
+                        "ocr-images",
+                        "ocr-preprocess",
                         "transcribe",
                         "verbose",
                         "funasr-rich-text",
@@ -2494,6 +2579,10 @@ def print_interactive_help() -> None:
                         "platform",
                         "output-dir",
                         "output-name",
+                        "ocr-output",
+                        "ocr-language",
+                        "ocr-bin",
+                        "ocr-psm",
                         "timeout",
                         "browser-timeout",
                         "chrome-path",
@@ -2553,7 +2642,6 @@ def set_interactive_option(
             raise DouyinDownloadError(
                 f"Invalid transcribe-engine. Use {', '.join(video_transcriber.TRANSCRIBE_ENGINES)}."
             )
-
     setattr(args, dest, value)
     if normalized == "cookie":
         cookie = normalize_cookie(str(value))
@@ -2754,6 +2842,7 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
                 print(f"size: {path.stat().st_size / 1024 / 1024:.2f} MiB ({path.stat().st_size} bytes)")
             else:
                 print(path)
+        ocr_images_if_needed(saved_paths, Path(image_output_name).stem, args)
         return 0
 
     best = candidates[0]

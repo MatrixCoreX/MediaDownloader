@@ -4,20 +4,84 @@
 
 主程序文件名是 `media_downloader.py`。
 
+这个项目的目标是把“复制分享文案 -> 解析公开视频/图片地址 -> 保存文件 -> 可选后处理”做成一条本地命令。基础下载路径只依赖 Python 标准库；OCR、转码、媒体信息和转文字需要额外安装本机工具、语言包或模型。
+
+## 快速开始
+
+进入项目目录后先确认 Python 版本。脚本使用了较新的 Python 语法，建议使用 Python 3.10 或更新版本：
+
+```bash
+python3 --version
+python3 media_downloader.py --help
+```
+
+下载一条分享内容：
+
+```bash
+python3 media_downloader.py "复制来的分享文案或链接"
+```
+
+不带参数启动交互模式，适合连续粘贴多条分享：
+
+```bash
+python3 media_downloader.py
+```
+
+只解析媒体直链、不下载文件：
+
+```bash
+python3 media_downloader.py --print-url "https://v.douyin.com/xxxx/"
+```
+
+下载后顺便显示媒体信息：
+
+```bash
+python3 media_downloader.py --show-info "https://v.douyin.com/xxxx/"
+```
+
+下载后顺便转文字：
+
+```bash
+python3 media_downloader.py --transcribe "https://v.douyin.com/xxxx/"
+```
+
+图文作品下载后默认会识别图片里的文字：
+
+```bash
+python3 media_downloader.py "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+如果只想本地处理已有视频，可以直接使用 `video_transcriber.py` 或 `x_transcoder.py`，不需要经过下载器。
+
+## 项目文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `media_downloader.py` | 主入口。负责读取分享内容、识别平台、解析候选媒体地址、下载文件，并可选调用转码或转写。 |
+| `image_ocr.py` | 本地图片 OCR 工具。使用系统里的 `tesseract` 命令识别图片文字，可以被主下载器调用，也可以单独处理本地图片。 |
+| `video_transcriber.py` | 本地音频拆分与语音转文字工具。可以被主下载器调用，也可以单独处理本地视频/音频文件。 |
+| `x_transcoder.py` | X/Twitter 上传兼容性检查与转码工具。可以被主下载器调用，也可以单独处理本地视频。 |
+| `install_funasr.sh` | 可选的 FunASR 环境安装脚本，会创建或复用本项目下的 `.venv`。 |
+| `tests/` | 单元测试，覆盖链接提取、平台识别、输出路径、交互参数、转写/转码命令构造等行为。 |
+
 ## 支持能力
 
-- `douyin`: 抖音公开视频、公开图文作品图片。
-- `kuaishou`: 快手公开视频。
-- `xiaohongshu`: 小红书视频笔记、公开图文作品图片。
-- `tiktok`: TikTok 公开视频。
+| 平台参数 | 支持媒体 | 常见链接域名 | 说明 |
+| --- | --- | --- | --- |
+| `douyin` | 抖音公开视频、公开图文作品图片 | `douyin.com`、`iesdouyin.com` | 支持从页面状态、接口数据和浏览器 fallback 中提取候选地址。 |
+| `kuaishou` | 快手公开视频 | `kuaishou.com`、`v.kuaishou.com`、`ksurl.cn`、`gifshow.com`、`kwai.com` | 支持公开短视频分享链接。 |
+| `xiaohongshu` | 小红书视频笔记、公开图文作品图片 | `xiaohongshu.com`、`xhslink.com`、`xhs.cn`、`xhscdn.com` | 图文笔记会保存为图片序列，视频笔记保存为视频。 |
+| `tiktok` | TikTok 公开视频 | `tiktok.com`、`vm.tiktok.com`、`vt.tiktok.com`、`tiktokcdn.com` | 会延续页面响应下发的临时 cookie 到同次视频下载请求。 |
 
 默认平台模式是 `--platform auto`，会根据分享链接自动识别平台。所有平台都只使用直连解析，不调用第三方解析网站。
 
 抖音等页面如果不再把公开视频地址直接写在 HTML/API 里，脚本会默认启动本机 Chromium 系浏览器无头模式，读取本机网络日志中的公开视频请求地址作为 fallback。这仍然不调用第三方解析网站。
 
+支持范围只包含当前用户可以正常访问的公开内容。脚本不会破解 DRM、不会绕过私密作品权限、不会移除已下载文件上的水印，也不会处理付费或未授权内容。
+
 ## 输出行为
 
-每次解析成功后都会提示媒体类型，交互模式和一次性模式一致：
+每次解析成功后都会提示媒体类型，交互模式和一次性模式一致。这个提示输出到 `stderr`：
 
 ```text
 detected_media: video (platform=douyin, candidates=5)
@@ -26,14 +90,21 @@ detected_media: video (platform=tiktok, candidates=1)
 detected_media: images (platform=xiaohongshu, count=1)
 ```
 
-媒体类型提示输出到 `stderr`。URL、下载后的文件路径输出到 `stdout`，方便配合管道或脚本处理。
+URL、下载后的文件路径、`ocr:`、`audio:`、`transcript:`、`x_output:` 等结果输出到 `stdout`，方便配合管道或脚本处理。解析过程、候选日志、OCR/转写进度和错误信息输出到 `stderr`。
 
-解析失败时会自动重试 3 次；每次解析都会向 `stderr` 打印 `parse_attempt: 当前次数/总次数`。交互模式和一次性模式一致。
+解析失败时会自动重试 3 次，也就是最多尝试 4 次；每次解析都会向 `stderr` 打印 `parse_attempt: 当前次数/总次数`。交互模式和一次性模式一致。
 
 默认输出文件名使用本地时间：
 
 ```text
 downloads/20260624_153012.mp4
+```
+
+如果指定的输出文件名没有 `.mp4` 后缀，视频下载会自动补成 `.mp4`。如果目标文件已存在且没有开启 `--overwrite`，下载器会自动生成不冲突的文件名，例如：
+
+```text
+downloads/20260624_153012.1.mp4
+downloads/20260624_153012.2.mp4
 ```
 
 图文作品会保存为图片序列：
@@ -42,6 +113,29 @@ downloads/20260624_153012.mp4
 downloads/20260624_153012_01.webp
 downloads/20260624_153012_02.webp
 downloads/20260624_153012_03.jpg
+```
+
+图片后缀会优先根据响应的 `Content-Type` 修正。只有 1 张图片时不会加 `_01`；多张图片才会使用 `_01`、`_02` 这样的序号。
+
+图文作品下载完成后默认会生成 OCR 文本文件，并输出 `ocr: 路径`：
+
+```text
+downloads/20260624_153012_01.webp
+downloads/20260624_153012_02.webp
+downloads/20260624_153012_ocr.txt
+```
+
+如果有多张图片，OCR 文本会按图片路径分段写入同一个 TXT 文件。
+
+加 `--save-meta` 会在输出旁边保存 JSON 元数据，内容包括平台、作品 ID、创建时间、候选媒体地址、图片候选地址和解析日志。视频元数据默认写到同名 `.json`，图文元数据使用图片序列前缀：
+
+```bash
+python3 media_downloader.py --save-meta "https://v.douyin.com/xxxx/"
+```
+
+```text
+downloads/20260624_153012.mp4
+downloads/20260624_153012.json
 ```
 
 ## 使用
@@ -87,6 +181,40 @@ python3 media_downloader.py --interactive
 
 `:extract-audio off` 只关闭“单独拆 WAV”功能，不会自动关闭转文字；如果 `:transcribe on` 仍然开启，下载后仍会生成或复用中间 WAV 并继续转文字。要停止转文字，需要执行 `:transcribe off`。`:clear audio-output` 只是清除自定义音频路径，恢复默认 `_audio.wav` 路径。
 
+交互命令可以用 `:` 或 `/` 开头，下面这些写法等价：
+
+```text
+:set platform douyin
+/set platform douyin
+:platform douyin
+
+:on transcribe
+:transcribe on
+
+:toggle verbose
+:verbose toggle
+```
+
+交互模式支持的布尔选项：
+
+```text
+browser-fallback, extract-audio, print-url, save-meta, show-info,
+ocr-images, ocr-preprocess, transcribe, verbose, funasr-rich-text, whisper-fast,
+whisper-no-gpu, whisper-progress, whisper-timestamps, whisper-translate,
+overwrite, x-compatible, x-force, x-overwrite
+```
+
+交互模式支持的取值选项：
+
+```text
+platform, output-dir, output-name, timeout, browser-timeout, chrome-path,
+cookie, ocr-output, ocr-language, ocr-bin, ocr-psm, audio-output,
+text-output, audio-sample-rate, audio-channels, transcribe-engine,
+funasr-model, funasr-device, funasr-vad-model, funasr-punc-model,
+funasr-batch-size-s, whisper-bin, whisper-model, whisper-language,
+whisper-threads, x-crf, x-output-dir
+```
+
 手动指定平台：
 
 ```bash
@@ -127,6 +255,171 @@ python3 media_downloader.py --show-info "https://v.douyin.com/xxxx/"
 
 视频会显示分辨率、时长、编码、码率和文件大小。图片会显示文件路径和大小。
 
+下载图文作品并识别图片文字：
+
+```bash
+python3 media_downloader.py "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+默认使用 Tesseract 的 `chi_sim` 语言包识别简体中文。中文图片里混用 `eng` 容易把大号中文误判成英文噪声；如果图片确实是中英文混排，可以按需指定语言、输出路径或页面分割模式：
+
+```bash
+python3 media_downloader.py \
+  --ocr-language chi_sim+eng \
+  --ocr-psm 6 \
+  --ocr-output downloads/post_ocr.txt \
+  "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+如果只想下载图片、不做 OCR：
+
+```bash
+python3 media_downloader.py --no-ocr-images "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+保存解析元数据：
+
+```bash
+python3 media_downloader.py --save-meta "https://v.douyin.com/xxxx/"
+```
+
+打开详细日志，排查解析失败或候选地址不可用：
+
+```bash
+python3 media_downloader.py -v "https://v.douyin.com/xxxx/"
+```
+
+覆盖指定输出文件：
+
+```bash
+python3 media_downloader.py --overwrite -o downloads --output-name clip.mp4 "https://v.douyin.com/xxxx/"
+```
+
+完整工作流示例：下载、保存元数据、显示媒体信息、转成 X 兼容 MP4、同时转文字：
+
+```bash
+python3 media_downloader.py \
+  --save-meta \
+  --show-info \
+  --x-compatible \
+  --transcribe \
+  "https://v.douyin.com/xxxx/"
+```
+
+## 主程序参数速查
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `share` | 无 | 位置参数，复制来的分享文案或 URL。 |
+| `-I`, `--interactive` | 自动判断 | 启动交互输入循环。不带参数且 stdin 是终端时也会自动进入交互模式。 |
+| `-i`, `--input-file` | 无 | 从 UTF-8 文本文件读取分享内容。 |
+| `-o`, `--output-dir` | `downloads` | 下载文件保存目录。 |
+| `--output-name` | 本地时间 | 指定输出文件名；视频会补 `.mp4`，图文会取文件名主体作为序列前缀。 |
+| `--platform` | `auto` | 手动指定平台：`douyin`、`kuaishou`、`xiaohongshu`、`tiktok`。 |
+| `--cookie` | 无 | 原始 Cookie 字符串，或包含 Cookie 的文本文件路径。 |
+| `--timeout` | `20` | HTTP 请求超时时间，单位秒。 |
+| `--print-url` | 关闭 | 只打印解析出的媒体地址，不下载。不能和 `--extract-audio`、`--transcribe` 同用。 |
+| `--save-meta` | 关闭 | 保存解析元数据 JSON。 |
+| `--show-info` | 关闭 | 下载后显示媒体信息；视频信息依赖 `ffprobe`。 |
+| `--ocr-images` | 开启 | 图文作品图片下载后，调用本机 Tesseract OCR 识别图片文字。视频作品会忽略此参数。 |
+| `--no-ocr-images` | 关闭 | 禁用图文作品下载后的 OCR。 |
+| `--ocr-preprocess` | 开启 | OCR 前先用 Pillow 做放大、增强对比度和黑白化，适合小红书文字卡片。 |
+| `--no-ocr-preprocess` | 关闭 | 禁用 OCR 图片预处理，直接把原图交给 Tesseract。 |
+| `--ocr-output` | 自动 | 自定义 OCR TXT 输出路径；默认是图片序列前缀加 `_ocr.txt`。 |
+| `--ocr-language` | `chi_sim` | Tesseract 语言列表，例如 `eng`、`chi_sim`、`chi_sim+eng`。 |
+| `--ocr-bin` | 自动查找 | 指定 `tesseract` 可执行文件路径或命令名。 |
+| `--ocr-psm` | `6` | Tesseract 页面分割模式；`6` 适合单个均匀文本块。需要自动分割时可改成 `3`。 |
+| `--overwrite` | 关闭 | 允许覆盖下载、音频或文字输出。未开启时，下载文件会自动避让重名。 |
+| `-v`, `--verbose` | 关闭 | 打印解析日志、候选 URL、ffmpeg/ASR 命令等调试信息。 |
+| `--browser-fallback` | 开启 | 直连解析无候选时，启用本机 Chromium 系浏览器 fallback。 |
+| `--no-browser-fallback` | 关闭 | 禁用浏览器 fallback，只走 HTTP 直连解析。 |
+| `--browser-timeout` | `30` | 浏览器 fallback 页面加载等待时间，单位秒。 |
+| `--chrome-path` | 自动查找 | 指定 Chrome/Chromium/Edge/Brave/Vivaldi 可执行文件路径或命令名。 |
+| `--extract-audio` | 关闭 | 下载视频后拆出 WAV 音频。图文作品会忽略此参数。 |
+| `--transcribe` | 关闭 | 下载视频后拆音频并转文字。图文作品会忽略此参数。 |
+| `--audio-output` | 自动 | 自定义 WAV 输出路径。 |
+| `--text-output` | 自动 | 自定义文字稿输出路径。 |
+| `--audio-sample-rate` | `16000` | 拆 WAV 时使用的采样率。 |
+| `--audio-channels` | `1` | 拆 WAV 时使用的声道数。 |
+| `--x-compatible` | 关闭 | 下载后检查并按需生成 X 兼容 MP4。 |
+| `--x-force` | 关闭 | 和 `--x-compatible` 一起使用，即使原文件已兼容也强制转码。 |
+| `--x-output-dir` | 原文件目录 | X 兼容文件输出目录。 |
+| `--x-overwrite` | 关闭 | 允许覆盖 X 兼容输出文件。 |
+| `--x-crf` | `23` | X 转码的 x264 CRF，数值越小质量越高、文件越大。 |
+
+## 图片 OCR
+
+图片 OCR 使用的是本机 `tesseract` 命令行引擎。主下载器默认会对图文作品下载后的图片做 OCR；视频作品不会触发 OCR。需要关闭时加 `--no-ocr-images`。
+
+OCR 是默认开启的可选后处理：如果本机没有安装 `tesseract` 或语言包缺失，图片仍会正常保存，程序只会向 `stderr` 打印 `warning: Image OCR skipped: ...` 并跳过 OCR。
+
+默认语言是 `chi_sim`，用于识别简体中文。默认还会用 Pillow 做轻量预处理：放大 2 倍、增强对比度、转成黑白图，再用 Tesseract `psm 6` 识别。这对文字卡片通常比直接识别原图更稳定。识别结果会保存到一个 TXT 文件，路径默认基于图片序列前缀生成：
+
+```text
+downloads/20260624_153012_01.jpg
+downloads/20260624_153012_02.jpg
+downloads/20260624_153012_ocr.txt
+```
+
+如果一条图文有多张图片，TXT 会按图片路径分段写入：
+
+```text
+## downloads/20260624_153012_01.jpg
+第一张图片识别出的文字
+
+## downloads/20260624_153012_02.jpg
+第二张图片识别出的文字
+```
+
+下载图文并 OCR：
+
+```bash
+python3 media_downloader.py "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+指定语言和输出文件。中英文混排图片可以改成 `chi_sim+eng`，纯英文图片可以改成 `eng`：
+
+```bash
+python3 media_downloader.py \
+  --ocr-language chi_sim+eng \
+  --ocr-output downloads/post_ocr.txt \
+  "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+指定 Tesseract 路径和页面分割模式：
+
+```bash
+python3 media_downloader.py \
+  --ocr-bin /usr/bin/tesseract \
+  --ocr-psm 6 \
+  "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+关闭 OCR 预处理，直接识别原图：
+
+```bash
+python3 media_downloader.py \
+  --no-ocr-preprocess \
+  "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+关闭主下载器默认 OCR：
+
+```bash
+python3 media_downloader.py --no-ocr-images "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+也可以单独识别本地图片：
+
+```bash
+python3 image_ocr.py downloads/input.jpg
+python3 image_ocr.py downloads/input_01.jpg downloads/input_02.jpg -o downloads/input_ocr.txt
+python3 image_ocr.py --language eng --psm 6 downloads/input.jpg
+python3 image_ocr.py --no-preprocess downloads/input.jpg
+```
+
+不传图片时，`image_ocr.py` 会默认处理 `downloads/` 里最新的图片文件。OCR 输出已存在时默认报错，加 `--overwrite` 才会覆盖。
+
 ## X 兼容转码
 
 默认只下载原文件，不检查、不转码。
@@ -161,6 +454,60 @@ python3 x_transcoder.py
 python3 x_transcoder.py --check downloads/input.mp4
 python3 x_transcoder.py downloads/input.mp4
 ```
+
+主下载器里启用 `--x-compatible` 时，转码输出默认和原文件同目录，并在原文件名后加 `_x`：
+
+```text
+downloads/20260624_153012.mp4
+downloads/20260624_153012_x.mp4
+```
+
+如果 `_x` 文件已存在且没有加 `--x-overwrite`，主下载器会自动避让重名，例如 `20260624_153012_x.1.mp4`。单独运行 `x_transcoder.py` 时，默认输出名是当前本地时间加 `_x`，例如 `20260624_153522_x.mp4`；如果显式指定的输出已存在，需要加 `--overwrite`。
+
+兼容性检查当前关注这些条件：
+
+- 文件扩展名和容器是 `.mp4` 或 `.mov`。
+- 视频编码是 H.264，像素格式是 `yuv420p`。
+- 如果有音频，音频编码需要是 AAC。
+- 帧率不高于 40 fps。
+- 文件大小不超过 512 MiB。
+- 时长不超过 140 秒。
+- 横屏分辨率不超过 1920x1080，竖屏分辨率不超过 1080x1920。
+
+转码输出默认使用：
+
+- MP4 容器。
+- H.264 视频，`high` profile，level `4.1`。
+- `yuv420p` 像素格式，30 fps。
+- AAC 音频，128 kbps，44.1 kHz，双声道。
+- `+faststart` 元数据，便于 Web 上传和处理。
+
+单独检查文件时，兼容返回码有特殊含义：兼容返回 `0`，不兼容返回 `2`，工具错误返回 `1`。
+
+`x_transcoder.py` 常用参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `input` | `downloads/` 下最新 MP4/MOV | 要检查或转码的视频。 |
+| `-o`, `--output` | 本地时间加 `_x` | 输出文件路径；会补 `.mp4`。 |
+| `--output-dir` | 输入文件目录 | 输出目录；指定 `--output` 时忽略。 |
+| `--downloads-dir` | `downloads` | 未提供输入文件时，从这个目录找最新 MP4/MOV。 |
+| `--suffix` | `_x` | 默认输出文件名后缀。 |
+| `--check` | 关闭 | 只检查兼容性，不转码。 |
+| `--force` | 关闭 | 即使输入已经兼容也继续转码。 |
+| `--overwrite` | 关闭 | 允许覆盖输出文件。 |
+| `--crf` | `23` | x264 质量参数，数值越小质量越高、文件越大。 |
+| `--preset` | `medium` | x264 编码预设。 |
+| `--fps` | `30` | 输出帧率。 |
+| `--audio-bitrate` | `128k` | AAC 音频码率。 |
+| `--h264-profile` | `high` | H.264 profile，可选 `baseline`、`main`、`high`。 |
+| `--h264-level` | `4.1` | H.264 level。 |
+| `--max-file-size-mb` | `512` | 兼容性检查的文件大小上限。 |
+| `--max-duration` | `140` | 兼容性检查的时长上限，单位秒。 |
+| `--max-fps` | `40` | 兼容性检查的帧率上限。 |
+| `--max-landscape-width` / `--max-landscape-height` | `1920` / `1080` | 横屏最大分辨率。 |
+| `--max-portrait-width` / `--max-portrait-height` | `1080` / `1920` | 竖屏最大分辨率。 |
+| `-v`, `--verbose` | 关闭 | 打印 ffmpeg 命令。 |
 
 ## 本机语音转文字
 
@@ -200,19 +547,25 @@ python3 media_downloader.py --transcribe --whisper-no-progress "https://v.douyin
 python3 media_downloader.py --transcribe --whisper-fast "https://v.douyin.com/xxxx/"
 ```
 
-如果要使用 FunASR，本机当前是 CPU 环境，默认配置为 `iic/SenseVoiceSmall`、`cpu`、`fsmn-vad`。系统 Python 是受管环境，建议先建虚拟环境安装依赖：
+如果要使用 FunASR，推荐运行一键安装脚本。脚本会创建或复用 `.venv`，自动检测 NVIDIA GPU；CPU 机器安装 CPU-only PyTorch，避免拉取 CUDA 大包，GPU 机器会安装默认 CUDA-capable PyTorch：
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip
-python -m pip install funasr modelscope torch torchaudio
+bash install_funasr.sh
+```
+
+可以先看安装计划，或手动指定模式：
+
+```bash
+bash install_funasr.sh --dry-run
+bash install_funasr.sh --cpu
+bash install_funasr.sh --cuda
+bash install_funasr.sh --preload-models
 ```
 
 安装后可以选择 FunASR 转写：
 
 ```bash
-python media_downloader.py \
+.venv/bin/python media_downloader.py \
   --transcribe \
   --transcribe-engine funasr \
   --funasr-model iic/SenseVoiceSmall \
@@ -220,10 +573,21 @@ python media_downloader.py \
   "https://v.douyin.com/xxxx/"
 ```
 
+如果使用 `install_funasr.sh` 安装，推荐直接用 `.venv/bin/python` 启动，或者先激活虚拟环境：
+
+```bash
+. .venv/bin/activate
+python media_downloader.py --transcribe --transcribe-engine funasr "https://v.douyin.com/xxxx/"
+```
+
+不强制必须是 `.venv`，但运行脚本的 Python 环境必须已经安装 `funasr`、`modelscope`、`torch`、`torchaudio`。如果这些包安装在 conda 环境里，就用 conda 环境里的 `python`；如果安装在项目 `.venv` 里，就用 `.venv/bin/python`。
+
+如果脚本检测到 GPU 并安装了 CUDA 版 PyTorch，运行时可以把 `--funasr-device` 改成 `cuda:0`。
+
 FunASR 使用 SenseVoice 时默认输出纯文字，会过滤情绪和声音事件 emoji。如果想保留这些富文本标记，例如背景音乐、笑声、情绪判断，可以加：
 
 ```bash
-python media_downloader.py --transcribe --transcribe-engine funasr --funasr-rich-text "https://v.douyin.com/xxxx/"
+.venv/bin/python media_downloader.py --transcribe --transcribe-engine funasr --funasr-rich-text "https://v.douyin.com/xxxx/"
 ```
 
 音频和文字输出路径使用独立参数：
@@ -306,7 +670,7 @@ python3 video_transcriber.py --no-progress downloads/input.mp4
 单独处理本地文件时也可以选择 FunASR：
 
 ```bash
-python video_transcriber.py --engine funasr downloads/input.mp4
+.venv/bin/python video_transcriber.py --engine funasr downloads/input.mp4
 ```
 
 默认会过滤 SenseVoice 富文本 emoji；需要保留时加 `--funasr-rich-text`。
@@ -332,6 +696,92 @@ python3 video_transcriber.py \
   --model ~/rustclaw/data/models/whisper.cpp/ggml-small.bin \
   downloads/input.mp4
 ```
+
+`video_transcriber.py` 的默认行为：
+
+- 不传输入文件时，会在 `downloads/` 里找最新的媒体文件。
+- 如果输入是视频，会先用 `ffmpeg` 拆出 WAV，再转文字。
+- 如果输入已经是 WAV，且没有自定义 `--audio-output`，会直接把这个 WAV 当作转写输入。
+- 默认 WAV 是 16 kHz、单声道、PCM s16le，更适合本地 ASR。
+- 默认文字稿是 `.txt`，文件名后缀为 `_transcript`。
+- 如果音频或文字输出已经存在，默认报错；加 `--overwrite` 才会覆盖。
+- 主下载器执行 `--transcribe` 时，如果默认中间 WAV 已存在，会自动复用，避免重复拆音频。
+
+`whisper.cpp` 自动查找顺序：
+
+| 类型 | 查找方式 |
+| --- | --- |
+| 可执行文件 | `--whisper-bin` 指定路径，或环境变量 `WHISPER_BIN`、`WHISPER_CPP_BIN`、`WHISPER_CLI`，或 PATH 中的 `whisper-cli`、`whisper.cpp`。 |
+| 模型文件 | `--whisper-model` / `--model` 指定路径，或环境变量 `WHISPER_MODEL`、`WHISPER_MODEL_PATH`、`WHISPER_CPP_MODEL`。 |
+| rustclaw 默认路径 | `~/rustclaw/data/vendor/whisper.cpp/build/bin/whisper-cli` 和 `~/rustclaw/data/models/whisper.cpp/ggml-*.bin`。 |
+
+可用环境变量：
+
+```text
+WHISPER_BIN
+WHISPER_CPP_BIN
+WHISPER_CLI
+WHISPER_MODEL
+WHISPER_MODEL_PATH
+WHISPER_CPP_MODEL
+RUSTCLAW_HOME
+RUSTCLAW_ROOT
+```
+
+FunASR 安装脚本参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--venv PATH` | 指定虚拟环境路径，默认是项目目录下的 `.venv`。 |
+| `--python COMMAND` | 指定创建虚拟环境用的 Python 命令，默认 `python3`。 |
+| `--mode auto/cpu/cuda` | 指定安装模式，默认自动检测。 |
+| `--cpu` | 强制安装 CPU-only PyTorch。 |
+| `--cuda` | 强制安装 CUDA-capable PyTorch。 |
+| `--preload-models` | 安装后预下载/缓存 SenseVoiceSmall 和 FSMN VAD。 |
+| `--dry-run` | 只打印安装计划，不实际安装。 |
+
+主下载器里的转写相关参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--transcribe` | 关闭 | 下载视频后拆音频并转文字。 |
+| `--extract-audio` | 关闭 | 只拆出 WAV；如果同时启用 `--transcribe`，仍会继续转文字。 |
+| `--audio-output` | 视频名加 `_audio.wav` | 自定义 WAV 输出路径。 |
+| `--text-output` | 视频名加 `_transcript.txt` | 自定义文字稿路径。 |
+| `--audio-sample-rate` | `16000` | WAV 采样率。 |
+| `--audio-channels` | `1` | WAV 声道数。 |
+| `--transcribe-engine` | `whisper` | 可选 `whisper` 或 `funasr`。 |
+| `--whisper-bin` | 自动查找 | whisper.cpp 可执行文件路径或命令名。 |
+| `--whisper-model` | 自动查找 | whisper.cpp ggml 模型路径。 |
+| `--whisper-language` | `auto` | 语音语言；`auto` 表示自动识别。 |
+| `--whisper-threads` | 自动，最多 8 | 传给 whisper.cpp 的线程数。 |
+| `--whisper-translate` | 关闭 | 请求 whisper.cpp 翻译成英文。 |
+| `--whisper-fast` | 关闭 | 使用更快的贪心解码参数，可能降低稳健性。 |
+| `--whisper-no-gpu` | 关闭 | 向 whisper.cpp 传 `--no-gpu`。 |
+| `--whisper-timestamps` | 关闭 | 保留 whisper.cpp 文本输出中的时间戳。 |
+| `--whisper-no-progress` | 关闭 | 不显示 whisper.cpp 转写进度。 |
+| `--funasr-model` | `iic/SenseVoiceSmall` | FunASR 模型 ID 或本地路径。 |
+| `--funasr-device` | `cpu` | FunASR 运行设备，例如 `cpu` 或 `cuda:0`。 |
+| `--funasr-vad-model` | `fsmn-vad` | FunASR VAD 模型；可用 `none` 或 `off` 关闭。 |
+| `--funasr-punc-model` | `none` | 可选标点模型；可用 `none` 或 `off`。 |
+| `--funasr-batch-size-s` | `60` | FunASR 批处理音频时长，单位秒。 |
+| `--funasr-rich-text` | 关闭 | 保留 SenseVoice 的情绪和声音事件富文本标记。 |
+
+`video_transcriber.py` 单独运行时的参数名略短：
+
+| 主下载器参数 | 单独转写工具参数 |
+| --- | --- |
+| `--transcribe-engine` | `--engine` |
+| `--whisper-model` | `--model` |
+| `--whisper-language` | `--language` |
+| `--whisper-threads` | `--threads` |
+| `--whisper-translate` | `--translate` |
+| `--whisper-fast` | `--fast` |
+| `--whisper-no-gpu` | `--no-gpu` |
+| `--whisper-timestamps` | `--timestamps` |
+| `--whisper-no-progress` | `--no-progress` |
+| `--audio-sample-rate` | `--sample-rate` |
+| `--audio-channels` | `--channels` |
 
 ## 浏览器 fallback
 
@@ -367,15 +817,144 @@ python3 media_downloader.py --cookie cookies.txt "https://v.douyin.com/xxxx/"
 
 ## 依赖
 
-默认解析和下载只需要 Python 3 标准库。
+默认解析和下载只需要 Python 标准库，不需要安装第三方 Python 包。
 
-浏览器 fallback 需要系统安装 Chrome、Chromium、Microsoft Edge、Brave、Vivaldi 等 Chromium 系浏览器之一。
+| 功能 | 需要的额外依赖 |
+| --- | --- |
+| 普通解析和下载 | Python 3.10+。 |
+| 浏览器 fallback | Chrome、Chromium、Microsoft Edge、Brave、Vivaldi 等 Chromium 系浏览器之一。 |
+| `--show-info` | `ffprobe`。通常随 `ffmpeg` 一起安装。 |
+| `--ocr-images` / `image_ocr.py` | `tesseract` 命令行程序、需要的语言数据，例如 `chi_sim`、`eng`；图片预处理需要 Python Pillow，缺失时会自动回退到原图。 |
+| `--x-compatible` / `x_transcoder.py` | `ffmpeg` 和 `ffprobe`。 |
+| `--extract-audio` / `video_transcriber.py` | `ffmpeg`。 |
+| `--transcribe` + `whisper` | `ffmpeg`、本机 `whisper.cpp` 可执行文件、ggml 模型文件。 |
+| `--transcribe` + `funasr` | `ffmpeg`，以及运行脚本的 Python 环境里安装 `funasr`、`modelscope`、`torch`、`torchaudio`。 |
 
-`--show-info` 需要系统安装 `ffprobe`。如果没有安装，工具仍会下载，但只能显示基础文件大小。
+Debian/Ubuntu 示例：
 
-`--x-compatible` 和 `x_transcoder.py` 需要系统安装 `ffmpeg` 和 `ffprobe`。不加 `--x-compatible` 时，主下载脚本不会执行 X 兼容检查或转码。
+```bash
+sudo apt update
+sudo apt install ffmpeg chromium tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng python3-pil
+```
 
-`video_transcriber.py` 需要系统安装 `ffmpeg`。默认 `whisper` 引擎需要可用的本机 `whisper.cpp` 可执行文件和 ggml 模型；`funasr` 引擎需要在当前 Python 环境安装 `funasr`、`modelscope`、`torch`、`torchaudio`。
+macOS 示例：
+
+```bash
+brew install ffmpeg tesseract tesseract-lang
+python3 -m pip install Pillow
+```
+
+确认 OCR 语言包：
+
+```bash
+tesseract --list-langs
+```
+
+FunASR 推荐使用项目自带脚本安装到 `.venv`：
+
+```bash
+bash install_funasr.sh
+.venv/bin/python media_downloader.py --transcribe --transcribe-engine funasr "https://v.douyin.com/xxxx/"
+```
+
+也可以安装到你自己的 conda 或系统 Python 环境。无论使用哪种方式，都要保证运行 `media_downloader.py` 或 `video_transcriber.py` 的那个 `python` 能导入 FunASR：
+
+```bash
+python -c "import funasr, modelscope, torch, torchaudio; print('ok')"
+```
+
+## 测试
+
+运行单元测试：
+
+```bash
+python3 -m unittest
+```
+
+只跑某个测试文件：
+
+```bash
+python3 -m unittest tests.test_media_downloader
+python3 -m unittest tests.test_image_ocr
+python3 -m unittest tests.test_video_transcriber
+python3 -m unittest tests.test_x_transcoder
+```
+
+这些测试不会真实访问平台下载媒体，主要验证解析函数、参数默认值、路径生成、转码命令和转写流程。
+
+## 常见问题
+
+`ModuleNotFoundError: No module named 'funasr'`
+
+运行脚本的 Python 环境没有安装 FunASR。用 `install_funasr.sh` 安装后，请使用 `.venv/bin/python ...`，或先执行 `. .venv/bin/activate`。如果你装在 conda 里，就先激活对应 conda 环境。
+
+`whisper.cpp binary was not found`
+
+默认 `whisper` 引擎找不到 `whisper-cli`。可以把 `whisper-cli` 放进 PATH，或者传 `--whisper-bin /path/to/whisper-cli`，也可以设置 `WHISPER_BIN`。
+
+`whisper.cpp model was not found`
+
+找不到 ggml 模型文件。传 `--whisper-model /path/to/ggml-small.bin`，或设置 `WHISPER_MODEL`。单独运行 `video_transcriber.py` 时参数名是 `--model`。
+
+`ffmpeg is required but was not found in PATH`
+
+需要安装 `ffmpeg`，并确认 `ffmpeg` 和 `ffprobe` 在 PATH 中：
+
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
+`warning: Image OCR skipped: tesseract is required but was not found in PATH.`
+
+图片已经下载成功，但 OCR 被跳过。需要安装 Tesseract OCR，并确认命令可用：
+
+```bash
+tesseract --version
+```
+
+如果安装在非 PATH 目录，可以指定路径：
+
+```bash
+python3 media_downloader.py --ocr-bin /path/to/tesseract "分享链接"
+```
+
+`Error opening data file ... chi_sim.traineddata`
+
+Tesseract 缺少对应语言数据。默认 OCR 语言是 `chi_sim`，需要简体中文语言包。可以安装语言包，或改成已有语言：
+
+```bash
+tesseract --list-langs
+python3 media_downloader.py --ocr-language eng "分享链接"
+```
+
+`No downloadable video URL was found`
+
+常见原因是作品不是公开可访问、链接过期、需要登录态、页面出现验证码/风控、平台页面结构变化，或者本机没有可用浏览器导致 fallback 无法执行。可以先加 `-v` 看解析日志：
+
+```bash
+python3 media_downloader.py -v "分享链接"
+```
+
+如果确认需要登录态，可以尝试传 Cookie：
+
+```bash
+python3 media_downloader.py --cookie cookies.txt "分享链接"
+```
+
+如果只想验证直连解析，不想启动浏览器 fallback：
+
+```bash
+python3 media_downloader.py --no-browser-fallback -v "分享链接"
+```
+
+`--print-url cannot be used with --extract-audio or --transcribe`
+
+`--print-url` 不会下载文件，而拆音频和转文字都需要本地媒体文件。先去掉 `--print-url` 下载，再做音频处理。
+
+输出文件已经存在
+
+下载器本身会自动避让视频/图片重名。转写输出和单独转码输出默认不覆盖已有文件，需要加对应的 `--overwrite`；主下载器里的 X 兼容输出要加 `--x-overwrite`。
 
 ## 说明
 
