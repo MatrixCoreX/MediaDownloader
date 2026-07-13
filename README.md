@@ -1,10 +1,10 @@
 # Media Downloader
 
-命令行媒体下载工具：粘贴抖音、快手、小红书或 TikTok 分享文案/链接，自动识别平台和媒体类型，然后下载可访问的原始媒体。
+命令行媒体下载工具：粘贴抖音、快手、小红书、TikTok 或 YouTube 分享文案/链接，自动识别平台和媒体类型，然后下载可访问的原始媒体。
 
 主程序文件名是 `media_downloader.py`。
 
-这个项目的目标是把“复制分享文案 -> 解析公开视频/图片地址 -> 保存文件 -> 可选后处理”做成一条本地命令。基础下载路径只依赖 Python 标准库；OCR、转码、媒体信息和转文字需要额外安装本机工具、语言包或模型。
+这个项目的目标是把“复制分享文案 -> 解析公开视频/图片地址 -> 保存文件 -> 可选后处理”做成一条本地命令。非 YouTube 的基础下载路径只依赖 Python 标准库；YouTube、OCR、转码、媒体信息和转文字需要额外安装本机工具、语言包或模型。
 
 ## 快速开始
 
@@ -45,6 +45,12 @@ python3 media_downloader.py --show-info "https://v.douyin.com/xxxx/"
 python3 media_downloader.py --transcribe "https://v.douyin.com/xxxx/"
 ```
 
+下载 YouTube 视频需要本机安装 `yt-dlp`：
+
+```bash
+python3 media_downloader.py "https://youtu.be/dQw4w9WgXcQ"
+```
+
 图文作品下载后默认会识别图片里的文字：
 
 ```bash
@@ -72,8 +78,9 @@ python3 media_downloader.py "https://www.xiaohongshu.com/discovery/item/xxxx"
 | `kuaishou` | 快手公开视频 | `kuaishou.com`、`v.kuaishou.com`、`ksurl.cn`、`gifshow.com`、`kwai.com` | 支持公开短视频分享链接。 |
 | `xiaohongshu` | 小红书视频笔记、公开图文作品图片 | `xiaohongshu.com`、`xhslink.com`、`xhs.cn`、`xhscdn.com` | 图文笔记会保存为图片序列，视频笔记保存为视频。 |
 | `tiktok` | TikTok 公开视频 | `tiktok.com`、`vm.tiktok.com`、`vt.tiktok.com`、`tiktokcdn.com` | 会延续页面响应下发的临时 cookie 到同次视频下载请求。 |
+| `youtube` | YouTube 公开视频和 Shorts | `youtube.com`、`youtu.be`、`youtube-nocookie.com` | 使用本机 `yt-dlp` 下载，支持后续转写、转码和媒体信息。 |
 
-默认平台模式是 `--platform auto`，会根据分享链接自动识别平台。所有平台都只使用直连解析，不调用第三方解析网站。
+默认平台模式是 `--platform auto`，会根据分享链接自动识别平台。除 YouTube 交给本机 `yt-dlp` 外，其它平台都使用本项目内置解析逻辑；不调用第三方解析网站。
 
 抖音等页面如果不再把公开视频地址直接写在 HTML/API 里，脚本会默认启动本机 Chromium 系浏览器无头模式，读取本机网络日志中的公开视频请求地址作为 fallback。这仍然不调用第三方解析网站。
 
@@ -87,10 +94,11 @@ python3 media_downloader.py "https://www.xiaohongshu.com/discovery/item/xxxx"
 detected_media: video (platform=douyin, candidates=5)
 detected_media: video (platform=kuaishou, candidates=1)
 detected_media: video (platform=tiktok, candidates=1)
+detected_media: video (platform=youtube, candidates=1)
 detected_media: images (platform=xiaohongshu, count=1)
 ```
 
-URL、下载后的文件路径、`ocr:`、`audio:`、`transcript:`、`x_output:` 等结果输出到 `stdout`，方便配合管道或脚本处理。解析过程、候选日志、OCR/转写进度和错误信息输出到 `stderr`。
+URL、下载后的文件路径、`ocr:`、`audio:`、`transcript:`、`x_output:` 等结果输出到 `stdout`，方便配合管道或脚本处理。解析过程、候选日志、OCR/转写进度和错误信息输出到 `stderr`。YouTube 的 `--print-url` 会调用 `yt-dlp --get-url`，可能输出视频流和音频流两行。
 
 解析失败时会自动重试 3 次，也就是最多尝试 4 次；每次解析都会向 `stderr` 打印 `parse_attempt: 当前次数/总次数`。交互模式和一次性模式一致。
 
@@ -208,7 +216,8 @@ overwrite, x-compatible, x-force, x-overwrite
 
 ```text
 platform, output-dir, output-name, timeout, browser-timeout, chrome-path,
-cookie, ocr-output, ocr-language, ocr-bin, ocr-psm, audio-output,
+cookie, yt-dlp-bin, youtube-format, ocr-output, ocr-language, ocr-bin, ocr-psm,
+ocr-min-line-confidence, audio-output,
 text-output, audio-sample-rate, audio-channels, transcribe-engine,
 funasr-model, funasr-device, funasr-vad-model, funasr-punc-model,
 funasr-batch-size-s, whisper-bin, whisper-model, whisper-language,
@@ -222,6 +231,7 @@ python3 media_downloader.py --platform douyin "抖音分享文案或链接"
 python3 media_downloader.py --platform kuaishou "快手分享文案或链接"
 python3 media_downloader.py --platform xiaohongshu "小红书分享文案或链接"
 python3 media_downloader.py --platform tiktok "TikTok 分享文案或链接"
+python3 media_downloader.py --platform youtube "YouTube 分享链接"
 ```
 
 只打印解析出的媒体地址，不下载：
@@ -259,6 +269,21 @@ python3 media_downloader.py --show-info "https://v.douyin.com/xxxx/"
 
 ```bash
 python3 media_downloader.py "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+下载 YouTube 视频：
+
+```bash
+python3 media_downloader.py "https://youtu.be/dQw4w9WgXcQ"
+```
+
+指定 `yt-dlp` 路径或格式选择：
+
+```bash
+python3 media_downloader.py \
+  --yt-dlp-bin /usr/local/bin/yt-dlp \
+  --youtube-format "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]" \
+  "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 ```
 
 默认使用 Tesseract 的 `chi_sim` 语言包识别简体中文。中文图片里混用 `eng` 容易把大号中文误判成英文噪声；如果图片确实是中英文混排，可以按需指定语言、输出路径或页面分割模式：
@@ -315,7 +340,7 @@ python3 media_downloader.py \
 | `-i`, `--input-file` | 无 | 从 UTF-8 文本文件读取分享内容。 |
 | `-o`, `--output-dir` | `downloads` | 下载文件保存目录。 |
 | `--output-name` | 本地时间 | 指定输出文件名；视频会补 `.mp4`，图文会取文件名主体作为序列前缀。 |
-| `--platform` | `auto` | 手动指定平台：`douyin`、`kuaishou`、`xiaohongshu`、`tiktok`。 |
+| `--platform` | `auto` | 手动指定平台：`douyin`、`kuaishou`、`xiaohongshu`、`tiktok`、`youtube`。 |
 | `--cookie` | 无 | 原始 Cookie 字符串，或包含 Cookie 的文本文件路径。 |
 | `--timeout` | `20` | HTTP 请求超时时间，单位秒。 |
 | `--print-url` | 关闭 | 只打印解析出的媒体地址，不下载。不能和 `--extract-audio`、`--transcribe` 同用。 |
@@ -323,18 +348,21 @@ python3 media_downloader.py \
 | `--show-info` | 关闭 | 下载后显示媒体信息；视频信息依赖 `ffprobe`。 |
 | `--ocr-images` | 开启 | 图文作品图片下载后，调用本机 Tesseract OCR 识别图片文字。视频作品会忽略此参数。 |
 | `--no-ocr-images` | 关闭 | 禁用图文作品下载后的 OCR。 |
-| `--ocr-preprocess` | 开启 | OCR 前先用 Pillow 做放大、增强对比度和黑白化，适合小红书文字卡片。 |
-| `--no-ocr-preprocess` | 关闭 | 禁用 OCR 图片预处理，直接把原图交给 Tesseract。 |
+| `--ocr-preprocess` | 开启 | OCR 时同时尝试原图和 Pillow 预处理图，按 Tesseract 行级置信度自动选择更好的结果。 |
+| `--no-ocr-preprocess` | 关闭 | 禁用 OCR 图片预处理，只把原图交给 Tesseract。 |
 | `--ocr-output` | 自动 | 自定义 OCR TXT 输出路径；默认是图片序列前缀加 `_ocr.txt`。 |
 | `--ocr-language` | `chi_sim` | Tesseract 语言列表，例如 `eng`、`chi_sim`、`chi_sim+eng`。 |
 | `--ocr-bin` | 自动查找 | 指定 `tesseract` 可执行文件路径或命令名。 |
 | `--ocr-psm` | `6` | Tesseract 页面分割模式；`6` 适合单个均匀文本块。需要自动分割时可改成 `3`。 |
+| `--ocr-min-line-confidence` | `15` | 丢弃低于该行级置信度的 OCR 行，用来过滤插画、图标等误识别噪声；设为负数可关闭过滤。 |
 | `--overwrite` | 关闭 | 允许覆盖下载、音频或文字输出。未开启时，下载文件会自动避让重名。 |
 | `-v`, `--verbose` | 关闭 | 打印解析日志、候选 URL、ffmpeg/ASR 命令等调试信息。 |
 | `--browser-fallback` | 开启 | 直连解析无候选时，启用本机 Chromium 系浏览器 fallback。 |
 | `--no-browser-fallback` | 关闭 | 禁用浏览器 fallback，只走 HTTP 直连解析。 |
 | `--browser-timeout` | `30` | 浏览器 fallback 页面加载等待时间，单位秒。 |
 | `--chrome-path` | 自动查找 | 指定 Chrome/Chromium/Edge/Brave/Vivaldi 可执行文件路径或命令名。 |
+| `--yt-dlp-bin` | 自动查找 | 指定 YouTube 下载使用的 `yt-dlp` 可执行文件路径或命令名。 |
+| `--youtube-format` | MP4 优先 | 传给 `yt-dlp -f` 的格式选择器；默认优先下载 MP4 视频 + M4A 音频。 |
 | `--extract-audio` | 关闭 | 下载视频后拆出 WAV 音频。图文作品会忽略此参数。 |
 | `--transcribe` | 关闭 | 下载视频后拆音频并转文字。图文作品会忽略此参数。 |
 | `--audio-output` | 自动 | 自定义 WAV 输出路径。 |
@@ -353,7 +381,7 @@ python3 media_downloader.py \
 
 OCR 是默认开启的可选后处理：如果本机没有安装 `tesseract` 或语言包缺失，图片仍会正常保存，程序只会向 `stderr` 打印 `warning: Image OCR skipped: ...` 并跳过 OCR。
 
-默认语言是 `chi_sim`，用于识别简体中文。默认还会用 Pillow 做轻量预处理：放大 2 倍、增强对比度、转成黑白图，再用 Tesseract `psm 6` 识别。这对文字卡片通常比直接识别原图更稳定。识别结果会保存到一个 TXT 文件，路径默认基于图片序列前缀生成：
+默认语言是 `chi_sim`，用于识别简体中文。默认会把原图和 Pillow 预处理图都交给 Tesseract `psm 6` + LSTM 引擎识别，然后按行级置信度自动选择更好的结果。预处理图会放大 2 倍、增强对比度并转成黑白图，适合大字文字卡片；原图通常更适合长段宋体/衬线字体。识别结果还会通过 Tesseract TSV 行级置信度过滤一次，默认丢弃低于 `15` 的行，减少插画、图标、表情被误识别成文字的情况。识别结果会保存到一个 TXT 文件，路径默认基于图片序列前缀生成：
 
 ```text
 downloads/20260624_153012_01.jpg
@@ -395,7 +423,19 @@ python3 media_downloader.py \
   "https://www.xiaohongshu.com/discovery/item/xxxx"
 ```
 
-关闭 OCR 预处理，直接识别原图：
+调低或关闭低置信度行过滤：
+
+```bash
+python3 media_downloader.py \
+  --ocr-min-line-confidence 5 \
+  "https://www.xiaohongshu.com/discovery/item/xxxx"
+
+python3 media_downloader.py \
+  --ocr-min-line-confidence -1 \
+  "https://www.xiaohongshu.com/discovery/item/xxxx"
+```
+
+关闭 OCR 预处理，只识别原图：
 
 ```bash
 python3 media_downloader.py \
@@ -415,10 +455,40 @@ python3 media_downloader.py --no-ocr-images "https://www.xiaohongshu.com/discove
 python3 image_ocr.py downloads/input.jpg
 python3 image_ocr.py downloads/input_01.jpg downloads/input_02.jpg -o downloads/input_ocr.txt
 python3 image_ocr.py --language eng --psm 6 downloads/input.jpg
+python3 image_ocr.py --min-line-confidence 5 downloads/input.jpg
 python3 image_ocr.py --no-preprocess downloads/input.jpg
 ```
 
-不传图片时，`image_ocr.py` 会默认处理 `downloads/` 里最新的图片文件。OCR 输出已存在时默认报错，加 `--overwrite` 才会覆盖。
+不传图片时，`image_ocr.py` 会默认处理 `downloads/` 里最新的图片文件。`--min-line-confidence` 和主下载器的 `--ocr-min-line-confidence` 含义相同。OCR 输出已存在时默认报错，加 `--overwrite` 才会覆盖。
+
+## YouTube 下载
+
+YouTube 下载使用本机 `yt-dlp`。脚本负责识别 YouTube 链接、组织输出路径、调用 `yt-dlp`，下载完成后继续复用本项目已有的媒体信息、音频提取、语音转文字和 X 兼容转码流程。
+
+默认格式选择器是：
+
+```text
+bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b
+```
+
+也就是优先下载 MP4 视频流和 M4A 音频流，并让 `yt-dlp` 合并成 MP4；如果没有合适的 MP4 流，再退回到 `yt-dlp` 可用的最佳格式。
+
+常用命令：
+
+```bash
+python3 media_downloader.py "https://youtu.be/dQw4w9WgXcQ"
+python3 media_downloader.py --show-info "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+python3 media_downloader.py --transcribe "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+python3 media_downloader.py --print-url "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
+
+限制分辨率示例：
+
+```bash
+python3 media_downloader.py \
+  --youtube-format "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]" \
+  "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+```
 
 ## X 兼容转码
 
@@ -817,11 +887,12 @@ python3 media_downloader.py --cookie cookies.txt "https://v.douyin.com/xxxx/"
 
 ## 依赖
 
-默认解析和下载只需要 Python 标准库，不需要安装第三方 Python 包。
+非 YouTube 的基础解析和下载只需要 Python 标准库，不需要安装第三方 Python 包。YouTube 下载依赖本机 `yt-dlp`。
 
 | 功能 | 需要的额外依赖 |
 | --- | --- |
 | 普通解析和下载 | Python 3.10+。 |
+| YouTube 下载 | `yt-dlp`。合并音视频或后续处理通常还需要 `ffmpeg`。 |
 | 浏览器 fallback | Chrome、Chromium、Microsoft Edge、Brave、Vivaldi 等 Chromium 系浏览器之一。 |
 | `--show-info` | `ffprobe`。通常随 `ffmpeg` 一起安装。 |
 | `--ocr-images` / `image_ocr.py` | `tesseract` 命令行程序、需要的语言数据，例如 `chi_sim`、`eng`；图片预处理需要 Python Pillow，缺失时会自动回退到原图。 |
@@ -834,13 +905,13 @@ Debian/Ubuntu 示例：
 
 ```bash
 sudo apt update
-sudo apt install ffmpeg chromium tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng python3-pil
+sudo apt install ffmpeg chromium yt-dlp tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng python3-pil
 ```
 
 macOS 示例：
 
 ```bash
-brew install ffmpeg tesseract tesseract-lang
+brew install ffmpeg yt-dlp tesseract tesseract-lang
 python3 -m pip install Pillow
 ```
 
@@ -903,6 +974,20 @@ python3 -m unittest tests.test_x_transcoder
 ```bash
 ffmpeg -version
 ffprobe -version
+```
+
+`yt-dlp is required for YouTube downloads but was not found in PATH.`
+
+YouTube 下载需要安装 `yt-dlp`，并确认命令可用：
+
+```bash
+yt-dlp --version
+```
+
+如果安装在非 PATH 目录，可以指定路径：
+
+```bash
+python3 media_downloader.py --yt-dlp-bin /path/to/yt-dlp "https://youtu.be/dQw4w9WgXcQ"
 ```
 
 `warning: Image OCR skipped: tesseract is required but was not found in PATH.`

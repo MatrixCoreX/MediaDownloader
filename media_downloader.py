@@ -82,6 +82,12 @@ TIKTOK_ID_PATTERNS = (
     re.compile(r"[?&](?:item_id|itemId|video_id|videoId)=(\d{10,})"),
     re.compile(r'"(?:id|itemId|item_id|videoId|video_id)"\s*:\s*"?(\d{10,})"?'),
 )
+YOUTUBE_ID_PATTERNS = (
+    re.compile(r"youtu\.be/([0-9A-Za-z_-]{11})"),
+    re.compile(r"/(?:shorts|embed|live)/([0-9A-Za-z_-]{11})"),
+    re.compile(r"[?&]v=([0-9A-Za-z_-]{11})"),
+    re.compile(r'"(?:videoId|video_id)"\s*:\s*"([0-9A-Za-z_-]{11})"'),
+)
 JS_STATE_MARKERS = (
     "__INITIAL_STATE__",
     "__APOLLO_STATE__",
@@ -96,9 +102,11 @@ DOUYIN_DOMAINS = ("douyin.com", "iesdouyin.com")
 KUAISHOU_DOMAINS = ("kuaishou.com", "gifshow.com", "ksurl.cn", "kwai.com", "v.kuaishou.com")
 XIAOHONGSHU_DOMAINS = ("xiaohongshu.com", "xhslink.com", "xhscdn.com", "xhs.cn")
 TIKTOK_DOMAINS = ("tiktok.com", "tiktokv.com", "tiktokcdn.com", "vm.tiktok.com", "vt.tiktok.com")
-PLATFORMS = ("auto", "douyin", "kuaishou", "xiaohongshu", "tiktok")
-PLATFORM_ALIASES = {"titok": "tiktok"}
+YOUTUBE_DOMAINS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+PLATFORMS = ("auto", "douyin", "kuaishou", "xiaohongshu", "tiktok", "youtube")
+PLATFORM_ALIASES = {"titok": "tiktok", "yt": "youtube"}
 PLATFORM_CHOICES = PLATFORMS + tuple(PLATFORM_ALIASES)
+DEFAULT_YOUTUBE_FORMAT = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
 OUTPUT_TIME_FORMAT = "%Y%m%d_%H%M%S"
 PARSE_RETRY_COUNT = 3
 DEFAULT_BROWSER_TIMEOUT = 30.0
@@ -213,12 +221,26 @@ def extract_tiktok_id(*parts: str) -> str | None:
     return None
 
 
+def extract_youtube_id(*parts: str) -> str | None:
+    for part in parts:
+        if not part:
+            continue
+        decoded = urllib.parse.unquote(html.unescape(part))
+        for pattern in YOUTUBE_ID_PATTERNS:
+            match = pattern.search(decoded)
+            if match:
+                return match.group(1)
+    return None
+
+
 def normalize_platform(platform: str) -> str:
     return PLATFORM_ALIASES.get(platform, platform)
 
 
 def detect_platform(text: str) -> str | None:
     lowered = text.lower()
+    if any(domain in lowered for domain in YOUTUBE_DOMAINS):
+        return "youtube"
     if any(domain in lowered for domain in KUAISHOU_DOMAINS):
         return "kuaishou"
     if any(domain in lowered for domain in XIAOHONGSHU_DOMAINS):
@@ -1307,6 +1329,7 @@ def platform_referer(platform: str) -> str:
         "kuaishou": "https://www.kuaishou.com/",
         "xiaohongshu": "https://www.xiaohongshu.com/",
         "tiktok": "https://www.tiktok.com/",
+        "youtube": "https://www.youtube.com/",
     }.get(platform, "https://www.douyin.com/")
 
 
@@ -1318,7 +1341,26 @@ def extract_platform_id(platform: str, *parts: str) -> str | None:
         return extract_xiaohongshu_id(*parts)
     if platform == "tiktok":
         return extract_tiktok_id(*parts)
+    if platform == "youtube":
+        return extract_youtube_id(*parts)
     return extract_aweme_id(*parts)
+
+
+def gather_youtube_candidates(share_text: str) -> tuple[str | None, list[Candidate], list[ImageCandidate], list[str]]:
+    urls = extract_urls(share_text)
+    if not urls:
+        if share_text.strip().startswith(("http://", "https://")):
+            urls = [share_text.strip()]
+        else:
+            raise DouyinDownloadError("No URL found in the share text.")
+
+    url = urls[0]
+    return (
+        extract_youtube_id(share_text, url),
+        [Candidate(url, "youtube.yt-dlp", 1, referer=platform_referer("youtube"))],
+        [],
+        [f"youtube: using yt-dlp for {url}"],
+    )
 
 
 def gather_web_platform_candidates(
@@ -1411,8 +1453,12 @@ def gather_candidates_for_request(
     if not resolved_platform:
         raise DouyinDownloadError(
             "Cannot detect platform from the share text. Pass --platform douyin, "
-            "--platform kuaishou, --platform xiaohongshu, or --platform tiktok."
+            "--platform kuaishou, --platform xiaohongshu, --platform tiktok, or --platform youtube."
         )
+
+    if resolved_platform == "youtube":
+        item_id, candidates, image_candidates, logs = gather_youtube_candidates(share_text)
+        return resolved_platform, item_id, candidates, image_candidates, logs
 
     if resolved_platform == "douyin":
         item_id, candidates, image_candidates, logs = gather_candidates(share_text, cookie=cookie, timeout=timeout)
@@ -1552,6 +1598,182 @@ def download_candidate(
         raise DouyinDownloadError(f"HTTP {exc.code} while downloading {candidate.url}") from exc
     except urllib.error.URLError as exc:
         raise DouyinDownloadError(f"Network error while downloading {candidate.url}: {exc.reason}") from exc
+
+
+def find_yt_dlp_binary(yt_dlp_bin: str | None = None) -> str:
+    if yt_dlp_bin:
+        expanded = Path(yt_dlp_bin).expanduser()
+        if expanded.exists():
+            return str(expanded)
+        found = shutil.which(yt_dlp_bin)
+        if found:
+            return found
+        raise DouyinDownloadError(f"yt-dlp binary was not found: {yt_dlp_bin}")
+
+    found = shutil.which("yt-dlp")
+    if not found:
+        raise DouyinDownloadError("yt-dlp is required for YouTube downloads but was not found in PATH.")
+    return found
+
+
+def output_stem_exists(output_dir: Path, stem: str) -> bool:
+    return any(path.is_file() and path.stem == stem for path in output_dir.iterdir())
+
+
+def unique_output_stem(output_dir: Path, stem: str) -> str:
+    if not output_stem_exists(output_dir, stem):
+        return stem
+    for index in range(1, 1000):
+        candidate = f"{stem}.{index}"
+        if not output_stem_exists(output_dir, candidate):
+            return candidate
+    raise DouyinDownloadError(f"Cannot find a free output filename stem near {output_dir / stem}")
+
+
+def youtube_output_template(output_dir: Path, output_name: str | None, *, overwrite: bool = False) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if output_name:
+        output_path = output_dir / output_name
+        stem = output_path.stem if output_path.suffix else output_path.name
+    else:
+        stem = timestamp_output_stem()
+
+    if not overwrite:
+        stem = unique_output_stem(output_dir, stem)
+    return output_dir / f"{stem}.%(ext)s"
+
+
+def build_youtube_command(
+    yt_dlp_bin: str,
+    url: str,
+    *,
+    output_template: Path | None = None,
+    format_selector: str = DEFAULT_YOUTUBE_FORMAT,
+    cookie: str | None = None,
+    timeout: float = 20.0,
+    overwrite: bool = False,
+    print_url: bool = False,
+) -> list[str]:
+    command = [
+        yt_dlp_bin,
+        "--no-playlist",
+        "--socket-timeout",
+        f"{timeout:g}",
+        "-f",
+        format_selector,
+    ]
+    if cookie:
+        command.extend(["--add-header", f"Cookie: {cookie}"])
+    if print_url:
+        command.append("--get-url")
+    else:
+        if output_template is None:
+            raise DouyinDownloadError("YouTube output template is required for download.")
+        command.extend(
+            [
+                "--merge-output-format",
+                "mp4",
+                "--print",
+                "after_move:filepath",
+                "-o",
+                str(output_template),
+            ]
+        )
+        command.append("--force-overwrites" if overwrite else "--no-overwrites")
+    command.append(url)
+    return command
+
+
+def ytdlp_error_message(completed: subprocess.CompletedProcess[str]) -> str:
+    detail = completed.stderr.strip() or completed.stdout.strip()
+    if not detail:
+        return f"yt-dlp failed with exit code {completed.returncode}"
+    return f"yt-dlp failed with exit code {completed.returncode}: {detail.splitlines()[-1]}"
+
+
+def ytdlp_stdout_path(stdout: str) -> Path | None:
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    return Path(lines[-1]).expanduser()
+
+
+def find_downloaded_youtube_output(output_template: Path) -> Path | None:
+    template_name = output_template.name
+    marker = "%(ext)s"
+    if marker not in template_name:
+        return output_template if output_template.exists() else None
+    prefix, suffix = template_name.split(marker, 1)
+    matches = sorted(
+        (
+            path
+            for path in output_template.parent.iterdir()
+            if path.is_file() and path.name.startswith(prefix) and path.name.endswith(suffix)
+        ),
+        key=lambda path: path.stat().st_mtime,
+    )
+    return matches[-1] if matches else None
+
+
+def download_youtube_video(
+    candidate: Candidate,
+    output_dir: Path,
+    *,
+    output_name: str | None = None,
+    yt_dlp_bin: str | None = None,
+    format_selector: str = DEFAULT_YOUTUBE_FORMAT,
+    cookie: str | None = None,
+    timeout: float = 20.0,
+    overwrite: bool = False,
+    verbose: bool = False,
+) -> Path:
+    executable = find_yt_dlp_binary(yt_dlp_bin)
+    output_template = youtube_output_template(output_dir, output_name, overwrite=overwrite)
+    command = build_youtube_command(
+        executable,
+        candidate.url,
+        output_template=output_template,
+        format_selector=format_selector,
+        cookie=candidate.cookie or cookie,
+        timeout=timeout,
+        overwrite=overwrite,
+    )
+    if verbose:
+        print(" ".join(command), file=sys.stderr)
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise DouyinDownloadError(ytdlp_error_message(completed))
+
+    saved_path = ytdlp_stdout_path(completed.stdout) or find_downloaded_youtube_output(output_template)
+    if saved_path is None:
+        raise DouyinDownloadError("yt-dlp completed but did not report an output file.")
+    return saved_path
+
+
+def print_youtube_media_urls(
+    candidate: Candidate,
+    *,
+    yt_dlp_bin: str | None = None,
+    format_selector: str = DEFAULT_YOUTUBE_FORMAT,
+    cookie: str | None = None,
+    timeout: float = 20.0,
+    verbose: bool = False,
+) -> None:
+    executable = find_yt_dlp_binary(yt_dlp_bin)
+    command = build_youtube_command(
+        executable,
+        candidate.url,
+        format_selector=format_selector,
+        cookie=candidate.cookie or cookie,
+        timeout=timeout,
+        print_url=True,
+    )
+    if verbose:
+        print(" ".join(command), file=sys.stderr)
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        raise DouyinDownloadError(ytdlp_error_message(completed))
+    print(completed.stdout.rstrip())
 
 
 def download_image_candidate(
@@ -1854,6 +2076,7 @@ def ocr_images_if_needed(paths: list[Path], output_stem: str, args: argparse.Nam
             language=args.ocr_language,
             psm=args.ocr_psm,
             preprocess=args.ocr_preprocess,
+            min_line_confidence=args.ocr_min_line_confidence,
             overwrite=args.overwrite,
             verbose=args.verbose,
         )
@@ -1879,6 +2102,19 @@ def media_type_message(platform: str, candidates: list[Candidate], image_candida
     if image_candidates:
         return f"detected_media: images (platform={platform}, count={len(image_candidates)})"
     return f"detected_media: unknown (platform={platform})"
+
+
+def handle_downloaded_video(path: Path, args: argparse.Namespace) -> None:
+    if args.show_info:
+        print_media_info(path)
+    else:
+        print(path)
+    extract_audio_and_transcribe_if_needed(path, args)
+    if args.x_compatible:
+        try:
+            make_x_compatible_if_needed(path, args)
+        except Exception as exc:
+            raise DouyinDownloadError(f"X-compatible transcode failed: {exc}") from exc
 
 
 def gather_candidates_for_request_with_retries(
@@ -1925,7 +2161,10 @@ def gather_candidates_for_request_with_retries(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download accessible Douyin, Kuaishou, Xiaohongshu, or TikTok media from copied share text.",
+        description=(
+            "Download accessible Douyin, Kuaishou, Xiaohongshu, TikTok, or YouTube media "
+            "from copied share text."
+        ),
     )
     parser.add_argument(
         "share",
@@ -1994,6 +2233,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Path or executable name for the Chromium-compatible browser used by fallback.",
     )
     parser.add_argument(
+        "--yt-dlp-bin",
+        help="Path or executable name for yt-dlp used by YouTube downloads.",
+    )
+    parser.add_argument(
+        "--youtube-format",
+        default=DEFAULT_YOUTUBE_FORMAT,
+        help=f"yt-dlp format selector for YouTube downloads. Default: {DEFAULT_YOUTUBE_FORMAT}",
+    )
+    parser.add_argument(
         "--print-url",
         action="store_true",
         help="Print the best extracted media URL without downloading.",
@@ -2040,12 +2288,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=image_ocr.DEFAULT_PSM,
         help=f"Tesseract page segmentation mode for --ocr-images. Default: {image_ocr.DEFAULT_PSM}",
     )
+    parser.add_argument(
+        "--ocr-min-line-confidence",
+        type=float,
+        default=image_ocr.DEFAULT_MIN_LINE_CONFIDENCE,
+        help=(
+            "Drop OCR lines whose weighted confidence is below this value. "
+            f"Default: {image_ocr.DEFAULT_MIN_LINE_CONFIDENCE}; set below 0 to disable."
+        ),
+    )
     ocr_preprocess_group = parser.add_mutually_exclusive_group()
     ocr_preprocess_group.add_argument(
         "--ocr-preprocess",
         action="store_true",
         default=image_ocr.DEFAULT_PREPROCESS,
-        help="Enhance images before OCR. Default: enabled",
+        help="Try enhanced images as OCR candidates and keep the best confidence result. Default: enabled",
     )
     ocr_preprocess_group.add_argument(
         "--no-ocr-preprocess",
@@ -2341,6 +2598,11 @@ INTERACTIVE_VALUE_OPTIONS = {
     "output-name": ("output_name", str, None),
     "ocr-bin": ("ocr_bin", str, None),
     "ocr-language": ("ocr_language", str, image_ocr.DEFAULT_LANGUAGE),
+    "ocr-min-line-confidence": (
+        "ocr_min_line_confidence",
+        float,
+        image_ocr.DEFAULT_MIN_LINE_CONFIDENCE,
+    ),
     "ocr-output": ("ocr_output", str, None),
     "ocr-psm": ("ocr_psm", int, image_ocr.DEFAULT_PSM),
     "platform": ("platform", str, "auto"),
@@ -2353,6 +2615,8 @@ INTERACTIVE_VALUE_OPTIONS = {
     "whisper-threads": ("whisper_threads", int, video_transcriber.default_whisper_threads()),
     "x-crf": ("x_crf", int, 23),
     "x-output-dir": ("x_output_dir", str, None),
+    "yt-dlp-bin": ("yt_dlp_bin", str, None),
+    "youtube-format": ("youtube_format", str, DEFAULT_YOUTUBE_FORMAT),
 }
 
 INTERACTIVE_STATUS_OPTIONS = [
@@ -2367,12 +2631,15 @@ INTERACTIVE_STATUS_OPTIONS = [
     "ocr-language",
     "ocr-bin",
     "ocr-psm",
+    "ocr-min-line-confidence",
     "ocr-preprocess",
     "overwrite",
     "browser-fallback",
     "timeout",
     "browser-timeout",
     "extract-audio",
+    "yt-dlp-bin",
+    "youtube-format",
     "transcribe",
     "audio-output",
     "text-output",
@@ -2399,7 +2666,7 @@ INTERACTIVE_COMMAND_OPTIONS = tuple(
 )
 INTERACTIVE_OPTION_NAMES = tuple(sorted(set(INTERACTIVE_BOOL_OPTIONS) | set(INTERACTIVE_VALUE_OPTIONS)))
 INTERACTIVE_BOOL_VALUES = ("on", "off", "toggle")
-INTERACTIVE_PLATFORM_VALUES = ("auto", "douyin", "kuaishou", "xiaohongshu", "tiktok")
+INTERACTIVE_PLATFORM_VALUES = ("auto", "douyin", "kuaishou", "xiaohongshu", "tiktok", "youtube")
 INTERACTIVE_TRANSCRIBE_ENGINE_VALUES = video_transcriber.TRANSCRIBE_ENGINES
 
 
@@ -2583,10 +2850,13 @@ def print_interactive_help() -> None:
                         "ocr-language",
                         "ocr-bin",
                         "ocr-psm",
+                        "ocr-min-line-confidence",
                         "timeout",
                         "browser-timeout",
                         "chrome-path",
                         "cookie",
+                        "yt-dlp-bin",
+                        "youtube-format",
                         "audio-output",
                         "text-output",
                         "audio-sample-rate",
@@ -2634,7 +2904,7 @@ def set_interactive_option(
         value = normalize_platform(str(value))
         if value not in PLATFORMS:
             raise DouyinDownloadError(
-                "Invalid platform. Use auto, douyin, kuaishou, xiaohongshu, or tiktok."
+                "Invalid platform. Use auto, douyin, kuaishou, xiaohongshu, tiktok, or youtube."
             )
     if normalized == "transcribe-engine":
         value = str(value).lower()
@@ -2814,6 +3084,16 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
         raise DouyinDownloadError("--print-url cannot be used with --extract-audio or --transcribe.")
 
     if args.print_url:
+        if platform == "youtube" and candidates:
+            print_youtube_media_urls(
+                candidates[0],
+                yt_dlp_bin=args.yt_dlp_bin,
+                format_selector=args.youtube_format,
+                cookie=cookie,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
+            return 0
         if candidates:
             print(candidates[0].url)
         else:
@@ -2845,7 +3125,22 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
         ocr_images_if_needed(saved_paths, Path(image_output_name).stem, args)
         return 0
 
-    best = candidates[0]
+    if platform == "youtube":
+        saved_path = download_youtube_video(
+            candidates[0],
+            Path(args.output_dir).expanduser(),
+            output_name=args.output_name,
+            yt_dlp_bin=args.yt_dlp_bin,
+            format_selector=args.youtube_format,
+            cookie=cookie,
+            timeout=args.timeout,
+            overwrite=args.overwrite,
+            verbose=args.verbose,
+        )
+        if args.save_meta:
+            save_metadata(saved_path.with_suffix(".json"), platform, item_id, candidates, image_candidates, logs)
+        handle_downloaded_video(saved_path, args)
+        return 0
 
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2875,16 +3170,7 @@ def handle_share_text(args: argparse.Namespace, share_text: str, cookie: str | N
 
         if args.save_meta:
             save_metadata(saved_path.with_suffix(".json"), platform, item_id, candidates, image_candidates, logs)
-        if args.show_info:
-            print_media_info(saved_path)
-        else:
-            print(saved_path)
-        extract_audio_and_transcribe_if_needed(saved_path, args)
-        if args.x_compatible:
-            try:
-                make_x_compatible_if_needed(saved_path, args)
-            except Exception as exc:
-                raise DouyinDownloadError(f"X-compatible transcode failed: {exc}") from exc
+        handle_downloaded_video(saved_path, args)
         return 0
 
     raise DouyinDownloadError(f"All candidates failed. Last error: {last_error}")

@@ -6,6 +6,7 @@ Run OCR on local image files with the Tesseract command-line engine.
 from __future__ import annotations
 
 import argparse
+import csv
 from contextlib import ExitStack
 import shutil
 import subprocess
@@ -18,7 +19,9 @@ from pathlib import Path
 DEFAULT_DOWNLOAD_DIR = "downloads"
 DEFAULT_LANGUAGE = "chi_sim"
 DEFAULT_PSM = 6
+DEFAULT_OEM = 1
 DEFAULT_PREPROCESS = True
+DEFAULT_MIN_LINE_CONFIDENCE = 15.0
 DEFAULT_SUFFIX = "_ocr"
 PREPROCESS_SCALE = 2
 PREPROCESS_CONTRAST = 2.0
@@ -44,6 +47,12 @@ class ImageOcrError(RuntimeError):
 class OcrResult:
     path: Path
     text: str
+
+
+@dataclass(frozen=True)
+class ParsedOcrText:
+    text: str
+    confidence: float
 
 
 def require_binary(name: str) -> str:
@@ -82,11 +91,150 @@ def build_tesseract_command(
     *,
     language: str,
     psm: int | None = None,
+    oem: int | None = None,
+    configs: dict[str, str] | None = None,
+    output_format: str | None = None,
 ) -> list[str]:
     command = [str(tesseract_bin), str(image_path), "stdout", "-l", language]
+    if oem is not None:
+        command.extend(["--oem", str(oem)])
     if psm is not None:
         command.extend(["--psm", str(psm)])
+    for key, value in (configs or {}).items():
+        command.extend(["-c", f"{key}={value}"])
+    if output_format:
+        command.append(output_format)
     return command
+
+
+def parse_tesseract_tsv_result(
+    tsv_text: str,
+    *,
+    min_line_confidence: float | None = DEFAULT_MIN_LINE_CONFIDENCE,
+) -> ParsedOcrText:
+    lines: dict[tuple[int, int, int, int], list[dict[str, object]]] = {}
+    reader = csv.DictReader(tsv_text.splitlines(), delimiter="\t", quoting=csv.QUOTE_NONE)
+    for row in reader:
+        if row.get("level") != "5":
+            continue
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            key = (
+                int(row.get("page_num") or 0),
+                int(row.get("block_num") or 0),
+                int(row.get("par_num") or 0),
+                int(row.get("line_num") or 0),
+            )
+            word = {
+                "left": int(row.get("left") or 0),
+                "top": int(row.get("top") or 0),
+                "width": int(row.get("width") or 0),
+                "height": int(row.get("height") or 0),
+                "conf": _parse_confidence(row.get("conf")),
+                "text": text,
+            }
+        except ValueError:
+            continue
+        lines.setdefault(key, []).append(word)
+
+    rendered: list[str] = []
+    confidence_total = 0.0
+    confidence_weight = 0
+    for key in sorted(lines):
+        words = sorted(lines[key], key=lambda word: (int(word["left"]), int(word["top"])))
+        line_confidence = _line_confidence(words)
+        if not _line_confidence_passes(line_confidence, min_line_confidence):
+            continue
+        line = _join_ocr_words(words)
+        if _is_likely_noise_line(line):
+            continue
+        if line:
+            rendered.append(line)
+            weight = max(len(line), 1)
+            confidence_total += line_confidence * weight
+            confidence_weight += weight
+    confidence = confidence_total / confidence_weight if confidence_weight else 0.0
+    return ParsedOcrText("\n".join(rendered), confidence)
+
+
+def parse_tesseract_tsv(tsv_text: str, *, min_line_confidence: float | None = DEFAULT_MIN_LINE_CONFIDENCE) -> str:
+    return parse_tesseract_tsv_result(tsv_text, min_line_confidence=min_line_confidence).text
+
+
+def _parse_confidence(value: str | None) -> float:
+    try:
+        return float(value or 0)
+    except ValueError:
+        return 0.0
+
+
+def _line_confidence(words: list[dict[str, object]]) -> float:
+    total_weight = 0
+    weighted_confidence = 0.0
+    for word in words:
+        text = str(word["text"])
+        weight = max(len(text), 1)
+        total_weight += weight
+        weighted_confidence += max(float(word["conf"]), 0.0) * weight
+    if not total_weight:
+        return 0.0
+    return weighted_confidence / total_weight
+
+
+def _line_confidence_passes(line_confidence: float, min_line_confidence: float | None) -> bool:
+    if min_line_confidence is None or min_line_confidence < 0:
+        return True
+    return line_confidence >= min_line_confidence
+
+
+def _is_likely_noise_line(line: str) -> bool:
+    text = line.strip()
+    if not text:
+        return False
+    cjk_count = sum(1 for char in text if _is_cjk(char))
+    digit_count = sum(1 for char in text if char.isdigit())
+    marker_count = sum(1 for char in text if char in "|~`^\\")
+    if marker_count and cjk_count < 2:
+        return True
+    if cjk_count == 0 and digit_count and len(text) <= 8:
+        return True
+    return False
+
+
+def _join_ocr_words(words: list[dict[str, object]]) -> str:
+    pieces: list[str] = []
+    previous: dict[str, object] | None = None
+    for word in words:
+        text = str(word["text"])
+        if previous is not None and _needs_space_between(previous, word):
+            pieces.append(" ")
+        pieces.append(text)
+        previous = word
+    return "".join(pieces).strip()
+
+
+def _needs_space_between(previous: dict[str, object], current: dict[str, object]) -> bool:
+    previous_text = str(previous["text"])
+    current_text = str(current["text"])
+    if not previous_text or not current_text:
+        return False
+    if _is_cjk(previous_text[-1]) and _is_cjk(current_text[0]):
+        return False
+    if current_text[0] in ",.;:!?%)]}，。；：！？、）】》":
+        return False
+    gap = int(current["left"]) - (int(previous["left"]) + int(previous["width"]))
+    height = max(int(previous["height"]), int(current["height"]), 1)
+    return gap > height * 0.2
+
+
+def _is_cjk(char: str) -> bool:
+    return (
+        "\u3400" <= char <= "\u4dbf"
+        or "\u4e00" <= char <= "\u9fff"
+        or "\uf900" <= char <= "\ufaff"
+    )
 
 
 def _lanczos_resampling(image_module: object) -> object:
@@ -161,6 +309,7 @@ def tesseract_ocr_image(
     language: str = DEFAULT_LANGUAGE,
     psm: int | None = DEFAULT_PSM,
     preprocess: bool = DEFAULT_PREPROCESS,
+    min_line_confidence: float | None = DEFAULT_MIN_LINE_CONFIDENCE,
     verbose: bool = False,
 ) -> OcrResult:
     if not image_path.exists():
@@ -174,22 +323,67 @@ def tesseract_ocr_image(
         executable = Path(found)
 
     with ExitStack() as stack:
-        tesseract_image_path = image_path
+        image_candidates = [image_path]
         if preprocess:
             temp_dir = Path(stack.enter_context(tempfile.TemporaryDirectory()))
-            tesseract_image_path = preprocess_image_for_ocr(image_path, temp_dir, verbose=verbose)
+            prepared = preprocess_image_for_ocr(image_path, temp_dir, verbose=verbose)
+            if prepared != image_path:
+                image_candidates.append(prepared)
 
-        command = build_tesseract_command(executable, tesseract_image_path, language=language, psm=psm)
-        if verbose:
-            print(" ".join(command), file=sys.stderr)
-        completed = subprocess.run(command, check=False, capture_output=True, text=True)
+        ocr_candidates = [
+            _run_tesseract_tsv(
+                executable,
+                candidate_path,
+                original_path=image_path,
+                language=language,
+                psm=psm,
+                min_line_confidence=min_line_confidence,
+                verbose=verbose,
+            )
+            for candidate_path in image_candidates
+        ]
+
+    best = max(ocr_candidates, key=_ocr_candidate_score)
+    return OcrResult(image_path, normalize_ocr_text(best.text))
+
+
+def _run_tesseract_tsv(
+    executable: Path,
+    image_path: Path,
+    *,
+    original_path: Path,
+    language: str,
+    psm: int | None,
+    min_line_confidence: float | None,
+    verbose: bool,
+) -> ParsedOcrText:
+    command = build_tesseract_command(
+        executable,
+        image_path,
+        language=language,
+        psm=psm,
+        oem=DEFAULT_OEM,
+        configs={"preserve_interword_spaces": "1"},
+        output_format="tsv",
+    )
+    if verbose:
+        print(" ".join(command), file=sys.stderr)
+    completed = subprocess.run(command, check=False, capture_output=True, text=True)
     if completed.returncode != 0:
         detail = completed.stderr.strip()
         raise ImageOcrError(
-            f"tesseract failed for {image_path} with exit code {completed.returncode}"
+            f"tesseract failed for {original_path} with exit code {completed.returncode}"
             + (f": {detail}" if detail else "")
         )
-    return OcrResult(image_path, normalize_ocr_text(completed.stdout))
+    return parse_tesseract_tsv_result(completed.stdout, min_line_confidence=min_line_confidence)
+
+
+def _ocr_candidate_score(candidate: ParsedOcrText) -> float:
+    text = candidate.text
+    cjk_count = sum(1 for char in text if _is_cjk(char))
+    latin_count = sum(1 for char in text if char.isascii() and char.isalpha())
+    marker_count = sum(1 for char in text if char in "|~`^\\")
+    return candidate.confidence + min(cjk_count, 200) * 0.03 - latin_count * 0.4 - marker_count * 1.5
 
 
 def render_ocr_results(results: list[OcrResult]) -> str:
@@ -218,6 +412,7 @@ def ocr_images(
     language: str = DEFAULT_LANGUAGE,
     psm: int | None = DEFAULT_PSM,
     preprocess: bool = DEFAULT_PREPROCESS,
+    min_line_confidence: float | None = DEFAULT_MIN_LINE_CONFIDENCE,
     overwrite: bool = False,
     verbose: bool = False,
 ) -> Path:
@@ -234,6 +429,7 @@ def ocr_images(
             language=language,
             psm=psm,
             preprocess=preprocess,
+            min_line_confidence=min_line_confidence,
             verbose=verbose,
         )
         for path in image_paths
@@ -261,13 +457,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=DEFAULT_PSM,
         help=f"Tesseract page segmentation mode. Default: {DEFAULT_PSM}",
     )
+    parser.add_argument(
+        "--min-line-confidence",
+        type=float,
+        default=DEFAULT_MIN_LINE_CONFIDENCE,
+        help=(
+            "Drop OCR lines whose weighted confidence is below this value. "
+            f"Default: {DEFAULT_MIN_LINE_CONFIDENCE}; set below 0 to disable."
+        ),
+    )
     preprocess_group = parser.add_mutually_exclusive_group()
     preprocess_group.add_argument(
         "--preprocess",
         dest="preprocess",
         action="store_true",
         default=DEFAULT_PREPROCESS,
-        help="Enhance images before OCR. Default: enabled",
+        help="Try enhanced images as OCR candidates and keep the best confidence result. Default: enabled",
     )
     preprocess_group.add_argument(
         "--no-preprocess",
@@ -294,6 +499,7 @@ def main(argv: list[str] | None = None) -> int:
             language=args.language,
             psm=args.psm,
             preprocess=args.preprocess,
+            min_line_confidence=args.min_line_confidence,
             overwrite=args.overwrite,
             verbose=args.verbose,
         )

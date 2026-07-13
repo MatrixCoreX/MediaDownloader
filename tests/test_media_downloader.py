@@ -80,6 +80,7 @@ class DouyinDownloaderTests(unittest.TestCase):
             dd.detect_platform("https://www.tiktok.com/@li_viaris/video/7654516637915188498"),
             "tiktok",
         )
+        self.assertEqual(dd.detect_platform("https://youtu.be/dQw4w9WgXcQ"), "youtube")
 
     def test_extract_tiktok_id(self) -> None:
         self.assertEqual(
@@ -88,6 +89,11 @@ class DouyinDownloaderTests(unittest.TestCase):
             ),
             "7654516637915188498",
         )
+
+    def test_extract_youtube_id(self) -> None:
+        self.assertEqual(dd.extract_youtube_id("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertEqual(dd.extract_youtube_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "dQw4w9WgXcQ")
+        self.assertEqual(dd.extract_youtube_id("https://www.youtube.com/shorts/dQw4w9WgXcQ"), "dQw4w9WgXcQ")
 
     def test_extract_kuaishou_candidates_from_json(self) -> None:
         payload = {
@@ -201,9 +207,30 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertEqual(dd.parse_args([]).ocr_language, dd.image_ocr.DEFAULT_LANGUAGE)
         self.assertEqual(dd.parse_args(["--ocr-language", "eng"]).ocr_language, "eng")
         self.assertEqual(dd.parse_args([]).ocr_psm, dd.image_ocr.DEFAULT_PSM)
+        self.assertEqual(
+            dd.parse_args([]).ocr_min_line_confidence,
+            dd.image_ocr.DEFAULT_MIN_LINE_CONFIDENCE,
+        )
+        self.assertEqual(dd.parse_args(["--ocr-min-line-confidence", "-1"]).ocr_min_line_confidence, -1)
         self.assertTrue(dd.parse_args([]).ocr_preprocess)
         self.assertFalse(dd.parse_args(["--no-ocr-preprocess"]).ocr_preprocess)
         self.assertTrue(dd.parse_args(["--ocr-preprocess"]).ocr_preprocess)
+
+    def test_youtube_options(self) -> None:
+        args = dd.parse_args(
+            [
+                "--platform",
+                "yt",
+                "--yt-dlp-bin",
+                "/bin/yt-dlp",
+                "--youtube-format",
+                "best",
+                "https://youtu.be/dQw4w9WgXcQ",
+            ]
+        )
+        self.assertEqual(dd.normalize_platform(args.platform), "youtube")
+        self.assertEqual(args.yt_dlp_bin, "/bin/yt-dlp")
+        self.assertEqual(args.youtube_format, "best")
 
     def test_browser_fallback_is_enabled_by_default(self) -> None:
         self.assertTrue(dd.parse_args([]).browser_fallback)
@@ -298,6 +325,18 @@ class DouyinDownloaderTests(unittest.TestCase):
             keep_running, cookie = dd.handle_interactive_command(args, ":platform titok", cookie)
             self.assertTrue(keep_running)
             self.assertEqual(args.platform, "tiktok")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":platform yt", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.platform, "youtube")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":youtube-format best", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.youtube_format, "best")
+
+            keep_running, cookie = dd.handle_interactive_command(args, ":yt-dlp-bin /bin/yt-dlp", cookie)
+            self.assertTrue(keep_running)
+            self.assertEqual(args.yt_dlp_bin, "/bin/yt-dlp")
 
             keep_running, cookie = dd.handle_interactive_command(args, ":transcribe-engine funasr", cookie)
             self.assertTrue(keep_running)
@@ -488,6 +527,8 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertIn("ocr-images ", dd.interactive_completion_candidates(":set ocr", 5, 8))
         self.assertIn("ocr-preprocess ", dd.interactive_completion_candidates(":set ocr", 5, 8))
         self.assertIn("douyin ", dd.interactive_completion_candidates(":set platform d", 14, 15))
+        self.assertIn("youtube ", dd.interactive_completion_candidates(":set platform y", 14, 15))
+        self.assertIn("youtube-format ", dd.interactive_completion_candidates(":set you", 5, 8))
         self.assertIn("funasr ", dd.interactive_completion_candidates(":set transcribe-engine f", 23, 24))
         self.assertIn("on ", dd.interactive_completion_candidates(":set funasr-rich-text o", 22, 23))
         self.assertIn("off ", dd.interactive_completion_candidates(":transcribe o", 12, 13))
@@ -849,6 +890,10 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertEqual(ocr_images.call_args.kwargs["language"], "eng")
         self.assertEqual(ocr_images.call_args.kwargs["psm"], dd.image_ocr.DEFAULT_PSM)
         self.assertTrue(ocr_images.call_args.kwargs["preprocess"])
+        self.assertEqual(
+            ocr_images.call_args.kwargs["min_line_confidence"],
+            dd.image_ocr.DEFAULT_MIN_LINE_CONFIDENCE,
+        )
         self.assertIn(f"ocr: {ocr_path}", stdout.getvalue())
 
     def test_no_ocr_images_disables_default_ocr(self) -> None:
@@ -932,6 +977,129 @@ class DouyinDownloaderTests(unittest.TestCase):
                     browser_fallback=True,
                 )
         self.assertEqual(platform, "tiktok")
+
+    def test_gather_youtube_candidates(self) -> None:
+        item_id, candidates, image_candidates, logs = dd.gather_youtube_candidates("https://youtu.be/dQw4w9WgXcQ")
+        self.assertEqual(item_id, "dQw4w9WgXcQ")
+        self.assertEqual(candidates[0].url, "https://youtu.be/dQw4w9WgXcQ")
+        self.assertEqual(candidates[0].source, "youtube.yt-dlp")
+        self.assertEqual(image_candidates, [])
+        self.assertIn("youtube: using yt-dlp", logs[0])
+
+    def test_build_youtube_download_command(self) -> None:
+        command = dd.build_youtube_command(
+            "/bin/yt-dlp",
+            "https://youtu.be/dQw4w9WgXcQ",
+            output_template=Path("downloads/video.%(ext)s"),
+            format_selector="best",
+            cookie="SID=abc",
+            timeout=12,
+            overwrite=True,
+        )
+        self.assertIn("--no-playlist", command)
+        self.assertIn("--merge-output-format", command)
+        self.assertIn("after_move:filepath", command)
+        self.assertIn("--force-overwrites", command)
+        self.assertIn("Cookie: SID=abc", command)
+
+    def test_build_youtube_print_url_command(self) -> None:
+        command = dd.build_youtube_command(
+            "/bin/yt-dlp",
+            "https://youtu.be/dQw4w9WgXcQ",
+            format_selector="best",
+            print_url=True,
+        )
+        self.assertIn("--get-url", command)
+        self.assertNotIn("-o", command)
+
+    def test_youtube_output_template_avoids_existing_stem_with_any_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "clip.webm").write_text("existing", encoding="utf-8")
+
+            self.assertEqual(
+                dd.youtube_output_template(output_dir, "clip.mp4"),
+                output_dir / "clip.1.%(ext)s",
+            )
+
+    def test_download_youtube_video_uses_ytdlp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_path = Path(tmpdir) / "clip.mp4"
+            saved_path.write_bytes(b"video")
+            completed = dd.subprocess.CompletedProcess(
+                ["/bin/yt-dlp"],
+                0,
+                f"{saved_path}\n",
+                "",
+            )
+            candidate = dd.Candidate("https://youtu.be/dQw4w9WgXcQ", "youtube.yt-dlp", 1)
+            with mock.patch("media_downloader.find_yt_dlp_binary", return_value="/bin/yt-dlp"), mock.patch(
+                "media_downloader.subprocess.run",
+                return_value=completed,
+            ) as run:
+                result = dd.download_youtube_video(
+                    candidate,
+                    Path(tmpdir),
+                    output_name="clip.mp4",
+                    format_selector="best",
+                    cookie="SID=abc",
+                    timeout=9,
+                    overwrite=True,
+                )
+
+        self.assertEqual(result, saved_path)
+        command = run.call_args.args[0]
+        self.assertIn("/bin/yt-dlp", command[0])
+        self.assertIn("best", command)
+        self.assertIn("Cookie: SID=abc", command)
+
+    def test_print_youtube_media_urls_uses_ytdlp(self) -> None:
+        completed = dd.subprocess.CompletedProcess(
+            ["/bin/yt-dlp"],
+            0,
+            "https://video.example/stream\nhttps://audio.example/stream\n",
+            "",
+        )
+        candidate = dd.Candidate("https://youtu.be/dQw4w9WgXcQ", "youtube.yt-dlp", 1)
+        with mock.patch("media_downloader.find_yt_dlp_binary", return_value="/bin/yt-dlp"), mock.patch(
+            "media_downloader.subprocess.run",
+            return_value=completed,
+        ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            dd.print_youtube_media_urls(candidate, format_selector="best")
+
+        self.assertIn("https://video.example/stream", stdout.getvalue())
+        self.assertIn("https://audio.example/stream", stdout.getvalue())
+
+    def test_handle_share_text_downloads_youtube_with_ytdlp(self) -> None:
+        args = dd.parse_args(["--platform", "youtube", "https://youtu.be/dQw4w9WgXcQ"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_path = Path(tmpdir) / "video.mp4"
+            with mock.patch(
+                "media_downloader.download_youtube_video",
+                return_value=saved_path,
+            ) as download_youtube, mock.patch(
+                "media_downloader.handle_downloaded_video",
+            ) as handle_video:
+                with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                    "sys.stderr",
+                    new_callable=io.StringIO,
+                ) as stderr:
+                    self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        self.assertEqual(download_youtube.call_args.args[0].url, "https://youtu.be/dQw4w9WgXcQ")
+        handle_video.assert_called_once_with(saved_path, args)
+        self.assertIn("platform=youtube", stderr.getvalue())
+
+    def test_handle_share_text_prints_youtube_media_urls(self) -> None:
+        args = dd.parse_args(["--print-url", "https://youtu.be/dQw4w9WgXcQ"])
+        with mock.patch("media_downloader.print_youtube_media_urls") as print_urls:
+            with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ):
+                self.assertEqual(dd.handle_share_text(args, args.share, None), 0)
+
+        print_urls.assert_called_once()
 
     def test_download_candidate_uses_candidate_cookie_and_referer(self) -> None:
         class FakeResponse:

@@ -12,6 +12,7 @@ class ImageOcrTests(unittest.TestCase):
         args = image_ocr.parse_args([])
         self.assertEqual(args.language, "chi_sim")
         self.assertEqual(args.psm, image_ocr.DEFAULT_PSM)
+        self.assertEqual(args.min_line_confidence, image_ocr.DEFAULT_MIN_LINE_CONFIDENCE)
         self.assertTrue(args.preprocess)
         self.assertFalse(image_ocr.parse_args(["--no-preprocess"]).preprocess)
 
@@ -44,14 +45,74 @@ class ImageOcrTests(unittest.TestCase):
             ["/usr/bin/tesseract", "input.jpg", "stdout", "-l", "chi_sim+eng", "--psm", "6"],
         )
 
+    def test_build_tesseract_command_with_accuracy_options(self) -> None:
+        command = image_ocr.build_tesseract_command(
+            "/usr/bin/tesseract",
+            Path("input.jpg"),
+            language="chi_sim",
+            psm=6,
+            oem=1,
+            configs={"preserve_interword_spaces": "1"},
+            output_format="tsv",
+        )
+        self.assertEqual(
+            command,
+            [
+                "/usr/bin/tesseract",
+                "input.jpg",
+                "stdout",
+                "-l",
+                "chi_sim",
+                "--oem",
+                "1",
+                "--psm",
+                "6",
+                "-c",
+                "preserve_interword_spaces=1",
+                "tsv",
+            ],
+        )
+
+    def test_parse_tesseract_tsv_filters_low_confidence_noise_lines(self) -> None:
+        tsv = "\n".join(
+            [
+                "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext",
+                "5\t1\t1\t1\t1\t1\t10\t10\t40\t40\t90\t有",
+                "5\t1\t1\t1\t1\t2\t70\t10\t40\t40\t88\t钱",
+                "5\t1\t1\t1\t2\t1\t30\t90\t20\t30\t6\t全",
+                "5\t1\t1\t1\t2\t2\t70\t90\t20\t30\t0\t昌",
+                "5\t1\t1\t1\t3\t1\t10\t150\t30\t40\t92\t1.",
+                "5\t1\t1\t1\t3\t2\t70\t150\t30\t40\t85\t不",
+                "5\t1\t1\t1\t3\t3\t110\t150\t60\t40\t33\t回应",
+            ]
+        )
+        self.assertEqual(image_ocr.parse_tesseract_tsv(tsv), "有钱\n1. 不回应")
+
+    def test_parse_tesseract_tsv_treats_quotes_as_plain_text(self) -> None:
+        tsv = "\n".join(
+            [
+                "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext",
+                "5\t1\t1\t1\t1\t1\t10\t10\t40\t40\t90\t不止\"一",
+                "5\t1\t1\t1\t1\t2\t60\t10\t40\t40\t91\t手",
+                "5\t1\t1\t1\t2\t1\t10\t70\t40\t40\t92\t而是",
+            ]
+        )
+        self.assertEqual(image_ocr.parse_tesseract_tsv(tsv), '不止"一手\n而是')
+
     def test_tesseract_ocr_image_returns_normalized_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = Path(tmpdir) / "input.jpg"
             image_path.write_bytes(b"image")
+            tsv = "\n".join(
+                [
+                    "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext",
+                    "5\t1\t1\t1\t1\t1\t10\t10\t40\t40\t90\thello",
+                ]
+            )
             completed = subprocess.CompletedProcess(
                 ["/usr/bin/tesseract"],
                 0,
-                "hello\f\n",
+                tsv,
                 "",
             )
             with mock.patch("image_ocr.shutil.which", return_value="/usr/bin/tesseract"), mock.patch(
@@ -62,6 +123,28 @@ class ImageOcrTests(unittest.TestCase):
 
         self.assertEqual(result.text, "hello")
         self.assertIn("--psm", run.call_args.args[0])
+        self.assertIn("tsv", run.call_args.args[0])
+
+    def test_tesseract_ocr_image_chooses_higher_confidence_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "input.jpg"
+            prepared_path = Path(tmpdir) / "prepared.png"
+            image_path.write_bytes(b"image")
+            prepared_path.write_bytes(b"prepared")
+
+            with mock.patch("image_ocr.shutil.which", return_value="/usr/bin/tesseract"), mock.patch(
+                "image_ocr.preprocess_image_for_ocr",
+                return_value=prepared_path,
+            ), mock.patch(
+                "image_ocr._run_tesseract_tsv",
+                side_effect=[
+                    image_ocr.ParsedOcrText("原图更准", 91),
+                    image_ocr.ParsedOcrText("预处理较差", 52),
+                ],
+            ):
+                result = image_ocr.tesseract_ocr_image(image_path)
+
+        self.assertEqual(result.text, "原图更准")
 
     def test_preprocess_image_for_ocr_writes_temporary_png(self) -> None:
         try:
@@ -134,6 +217,10 @@ class ImageOcrTests(unittest.TestCase):
                 image_ocr.ocr_images([image_path], output=str(output_path), preprocess=False)
 
             self.assertFalse(ocr_image.call_args.kwargs["preprocess"])
+            self.assertEqual(
+                ocr_image.call_args.kwargs["min_line_confidence"],
+                image_ocr.DEFAULT_MIN_LINE_CONFIDENCE,
+            )
 
 
 if __name__ == "__main__":
