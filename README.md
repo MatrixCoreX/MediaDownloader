@@ -179,6 +179,8 @@ python3 media_downloader.py --interactive
 :history
 :queue
 :cancel
+:ocr-file "input.jpg"
+:ocr-file "/path/to/input image.png"
 :x-file "input.mp4"
 :x-file "/path/to/input video.mp4"
 :x-folder "/path/to/videos"
@@ -194,7 +196,7 @@ python3 media_downloader.py --interactive
 :quit
 ```
 
-`:x-file 视频路径` 会手动指定一个本地视频加入 X 兼容处理队列。绝对路径直接使用；只写文件名或相对路径时，会先从 `media_downloader.py` 所在目录查找，找不到再从当前 `output-dir`（默认 `downloads/`）查找。`:x-folder 文件夹` 会递归处理整个文件夹，`:x 文件夹` 是文件夹模式的简写。任务会保存入队时的 X 参数设置；已兼容文件始终跳过，不会生成副本。布尔参数也支持快捷写法，例如 `:transcribe on`、`:extract-audio off`、`:x-compatible toggle`。路径、平台、超时、whisper 模型等参数支持 `:set 参数名 值`；输入 `:status` 可以查看当前配置。
+`:ocr-file 图片路径` 会把指定本地图片加入 OCR 队列，打印识别进度，并默认在图片旁保存 `原文件名_ocr.txt`。`:x-file 视频路径` 会手动指定一个本地视频加入 X 兼容处理队列。两条文件命令的绝对路径都会直接使用；只写文件名或相对路径时，会先从 `media_downloader.py` 所在目录查找，找不到再从当前 `output-dir`（默认 `downloads/`）查找。`:x-folder 文件夹` 会递归处理整个文件夹，`:x 文件夹` 是文件夹模式的简写。任务会保存入队时的 OCR 或 X 参数设置；已兼容 X 文件始终跳过，不会生成副本。布尔参数也支持快捷写法，例如 `:transcribe on`、`:extract-audio off`、`:x-compatible toggle`。路径、平台、超时、whisper 模型等参数支持 `:set 参数名 值`；输入 `:status` 可以查看当前配置。
 
 `:extract-audio off` 只关闭“单独拆 WAV”功能，不会自动关闭转文字；如果 `:transcribe on` 仍然开启，下载后仍会生成或复用中间 WAV 并继续转文字。要停止转文字，需要执行 `:transcribe off`。`:clear audio-output` 只是清除自定义音频路径，恢复默认 `_audio.wav` 路径。
 
@@ -419,6 +421,7 @@ python3 media_downloader.py \
 | `--print-url` | 关闭 | 只打印解析出的媒体地址，不下载。不能和 `--extract-audio`、`--transcribe` 同用。 |
 | `--save-meta` | 关闭 | 保存解析元数据 JSON。 |
 | `--show-info` | 关闭 | 下载后显示媒体信息；视频信息依赖 `ffprobe`。 |
+| `--ocr-file` | 无 | 直接 OCR 一张本地图片并保存 `_ocr.txt`，无需提供分享链接。 |
 | `--ocr-images` | 开启 | 图文作品图片下载后，调用本机 Tesseract OCR 识别图片文字。视频作品会忽略此参数。 |
 | `--no-ocr-images` | 关闭 | 禁用图文作品下载后的 OCR。 |
 | `--ocr-preprocess` | 开启 | OCR 时同时尝试原图和 Pillow 预处理图，按 Tesseract 行级置信度自动选择更好的结果。 |
@@ -541,12 +544,23 @@ python3 media_downloader.py --no-ocr-images "https://www.xiaohongshu.com/discove
 也可以单独识别本地图片：
 
 ```bash
+.venv/bin/python media_downloader.py --ocr-file downloads/input.jpg
+.venv/bin/python media_downloader.py --ocr-file "input image.png" --ocr-language eng
 python3 image_ocr.py downloads/input.jpg
 python3 image_ocr.py downloads/input_01.jpg downloads/input_02.jpg -o downloads/input_ocr.txt
 python3 image_ocr.py --language eng --psm 6 downloads/input.jpg
 python3 image_ocr.py --min-line-confidence 5 downloads/input.jpg
 python3 image_ocr.py --no-preprocess downloads/input.jpg
 ```
+
+交互模式下可以继续输入其他任务，OCR 会按队列顺序在后台执行：
+
+```text
+media> :ocr-file "downloads/input.jpg"
+media> :ocr-file "input image.png"
+```
+
+`--ocr-file` 和 `:ocr-file` 都支持 `.jpg`、`.jpeg`、`.png`、`.webp`、`.tif`、`.tiff`、`.bmp`、`.gif`、`.avif`。默认输出在原图片旁并追加 `_ocr.txt`；可以先用 `:set ocr-output 路径` 指定后续交互任务的输出位置，已有文件默认不会覆盖，开启 `:overwrite on` 后才会覆盖。
 
 不传图片时，`image_ocr.py` 会默认处理 `downloads/` 里最新的图片文件。`--min-line-confidence` 和主下载器的 `--ocr-min-line-confidence` 含义相同。OCR 输出已存在时默认报错，加 `--overwrite` 才会覆盖。
 

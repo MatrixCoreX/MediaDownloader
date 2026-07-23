@@ -4406,6 +4406,13 @@ def resolve_x_file_path(
     file_text: str,
     output_dir: str | Path | None = None,
 ) -> Path:
+    return resolve_local_file_path(file_text, output_dir)
+
+
+def resolve_local_file_path(
+    file_text: str,
+    output_dir: str | Path | None = None,
+) -> Path:
     path = Path(file_text).expanduser()
     if path.is_absolute():
         return path.resolve()
@@ -4421,6 +4428,59 @@ def resolve_x_file_path(
     if download_path.exists():
         return download_path
     return script_path
+
+
+def resolve_ocr_input_path(
+    file_text: str,
+    output_dir: str | Path | None = None,
+) -> Path:
+    path = resolve_local_file_path(file_text, output_dir)
+    if not path.exists():
+        raise DouyinDownloadError(f"OCR input image does not exist: {path}")
+    if not path.is_file():
+        raise DouyinDownloadError(f"OCR input image is not a file: {path}")
+    if path.suffix.lower() not in image_ocr.IMAGE_EXTENSIONS:
+        supported = ", ".join(sorted(image_ocr.IMAGE_EXTENSIONS))
+        raise DouyinDownloadError(
+            f"Unsupported OCR input image extension {path.suffix or '<none>'}; "
+            f"supported: {supported}"
+        )
+    return path
+
+
+def process_ocr_file(args: argparse.Namespace) -> int:
+    raw_path = getattr(args, "ocr_file", None)
+    if not raw_path:
+        raise DouyinDownloadError("No image file was supplied for OCR.")
+    path = resolve_ocr_input_path(
+        str(raw_path),
+        getattr(args, "output_dir", None),
+    )
+
+    print(f"ocr_file_start: {path}", flush=True)
+    raise_if_task_cancelled()
+    try:
+        output_path = image_ocr.ocr_images(
+            [path],
+            output=args.ocr_output,
+            tesseract_bin=args.ocr_bin,
+            language=args.ocr_language,
+            psm=args.ocr_psm,
+            preprocess=args.ocr_preprocess,
+            min_line_confidence=args.ocr_min_line_confidence,
+            overwrite=args.overwrite,
+            verbose=args.verbose,
+            print_progress=True,
+        )
+    except image_ocr.ImageOcrError as exc:
+        raise DouyinDownloadError(f"OCR file processing failed: {exc}") from exc
+    raise_if_task_cancelled()
+    print(f"ocr: {output_path}", flush=True)
+    print(
+        f"ocr_file_completed: input={path} output={output_path}",
+        flush=True,
+    )
+    return 0
 
 
 def process_x_folder(args: argparse.Namespace) -> int:
@@ -4993,6 +5053,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--ocr-file",
+        help=(
+            "Run OCR on one local image and save an _ocr.txt file. "
+            "Relative paths are resolved from the script directory or --output-dir."
+        ),
+    )
+    parser.add_argument(
         "--x-compatible",
         action="store_true",
         default=False,
@@ -5117,6 +5184,7 @@ INTERACTIVE_BASE_COMMANDS = (
     "quit",
     "exit",
     "q",
+    "ocr-file",
     "x",
     "x-file",
     "x-folder",
@@ -5392,6 +5460,7 @@ def print_interactive_help() -> None:
                 "  :history                      show recent input history",
                 "  :queue / :jobs                show background task queue",
                 "  :cancel                       cancel running and queued tasks",
+                "  :ocr-file <image>             queue OCR for one local image",
                 "  :x-file <video>               queue one video for X compatibility processing",
                 "  :x-folder <directory>         queue recursive X compatibility processing",
                 "  :x <directory>                shortcut for :x-folder",
@@ -5609,6 +5678,13 @@ def handle_interactive_command(
         if task_queue is None:
             raise DouyinDownloadError("Interactive task queue is unavailable.")
         task_queue.enqueue_x_file(args, " ".join(tokens[1:]))
+        return True, cookie
+    if command == "ocr-file":
+        if len(tokens) < 2:
+            raise DouyinDownloadError("Usage: :ocr-file <image>")
+        if task_queue is None:
+            raise DouyinDownloadError("Interactive task queue is unavailable.")
+        task_queue.enqueue_ocr_file(args, " ".join(tokens[1:]))
         return True, cookie
     if command in {"history", "hist"}:
         limit = 20
@@ -6713,10 +6789,12 @@ class InteractiveTaskQueue:
         handler: Any | None = None,
         x_folder_handler: Any | None = None,
         x_file_handler: Any | None = None,
+        ocr_file_handler: Any | None = None,
     ) -> None:
         self._handler = handler or handle_share_text
         self._x_folder_handler = x_folder_handler or process_x_folder
         self._x_file_handler = x_file_handler or process_x_file
+        self._ocr_file_handler = ocr_file_handler or process_ocr_file
         self._pending: queue.Queue[InteractiveDownloadTask | None] = queue.Queue()
         self._tasks: list[InteractiveDownloadTask] = []
         self._lock = threading.RLock()
@@ -6842,6 +6920,44 @@ class InteractiveTaskQueue:
         self._pending.put(task)
         return task
 
+    def enqueue_ocr_file(
+        self,
+        args: argparse.Namespace,
+        file_text: str,
+    ) -> InteractiveDownloadTask:
+        path = resolve_ocr_input_path(
+            file_text,
+            getattr(args, "output_dir", None),
+        )
+
+        task_args = copy.deepcopy(args)
+        task_args.ocr_file = str(path)
+        label = str(path)
+        if len(label) > 96:
+            label = "..." + label[-93:]
+        with self._lock:
+            if self._closed:
+                raise DouyinDownloadError("Interactive task queue is already closed.")
+            task = InteractiveDownloadTask(
+                task_id=self._next_task_id,
+                share_text=str(path),
+                args=task_args,
+                cookie=None,
+                platform="ocr",
+                label=label,
+                kind="ocr_file",
+            )
+            self._next_task_id += 1
+            self._tasks.append(task)
+
+        sys.stderr.write(
+            f"task_queued: #{task.task_id} platform={task.platform} {task.label}\n"
+            f"{self.format_snapshot()}\n"
+        )
+        sys.stderr.flush()
+        self._pending.put(task)
+        return task
+
     def snapshot(self) -> list[InteractiveDownloadTask]:
         with self._lock:
             return [copy.copy(task) for task in self._tasks]
@@ -6936,6 +7052,8 @@ class InteractiveTaskQueue:
                         result = self._x_folder_handler(task.args)
                     elif task.kind == "x_file":
                         result = self._x_file_handler(task.args)
+                    elif task.kind == "ocr_file":
+                        result = self._ocr_file_handler(task.args)
                     else:
                         result = self._handler(task.args, task.share_text, task.cookie)
                 except OperationCancelled:
@@ -6971,6 +7089,7 @@ def interactive_loop(args: argparse.Namespace, cookie: str | None) -> int:
     print("Media Downloader interactive mode")
     print("Paste share text or URL to queue it. One background worker processes tasks in order.")
     print("Append 'all' to a Douyin or Xiaohongshu profile URL to download every available post.")
+    print("Use :ocr-file <image> to queue OCR for one local image.")
     print("Use :x-file <video> to queue one local video for X-compatible processing.")
     print("Use :x-folder <directory> or :x <directory> to queue X-compatible folder processing.")
     print("Type :queue to show jobs, :cancel to cancel jobs, :help for commands, or exit/quit/q to stop.")
@@ -7032,6 +7151,7 @@ def interactive_loop(args: argparse.Namespace, cookie: str | None) -> int:
 def should_start_interactive(args: argparse.Namespace) -> bool:
     return args.interactive or (
         not args.x_folder
+        and not args.ocr_file
         and not args.share
         and not args.input_file
         and sys.stdin.isatty()
@@ -7043,6 +7163,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.x_folder:
         try:
             return process_x_folder(args)
+        except (DouyinDownloadError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if args.ocr_file:
+        try:
+            return process_ocr_file(args)
         except (DouyinDownloadError, OSError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1

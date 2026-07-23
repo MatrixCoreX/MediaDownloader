@@ -830,6 +830,12 @@ class DouyinDownloaderTests(unittest.TestCase):
         with mock.patch.object(sys.stdin, "isatty", return_value=True):
             self.assertFalse(dd.should_start_interactive(args))
 
+    def test_ocr_file_prevents_implicit_interactive_mode(self) -> None:
+        args = dd.parse_args(["--ocr-file", "downloads/image.jpg"])
+        self.assertEqual(args.ocr_file, "downloads/image.jpg")
+        with mock.patch.object(sys.stdin, "isatty", return_value=True):
+            self.assertFalse(dd.should_start_interactive(args))
+
     def test_interactive_x_compatible_requires_explicit_flag(self) -> None:
         self.assertFalse(dd.parse_args(["--interactive"]).x_compatible)
         self.assertTrue(dd.parse_args(["--interactive", "--x-compatible"]).x_compatible)
@@ -1126,6 +1132,24 @@ class DouyinDownloaderTests(unittest.TestCase):
             "/tmp/videos with spaces/input video.mp4",
         )
 
+    def test_interactive_ocr_file_command_queues_one_image(self) -> None:
+        args = dd.parse_args(["--interactive"])
+        task_queue = mock.Mock()
+
+        keep_running, cookie = dd.handle_interactive_command(
+            args,
+            ':ocr-file "/tmp/images with spaces/input image.jpg"',
+            None,
+            task_queue,
+        )
+
+        self.assertTrue(keep_running)
+        self.assertIsNone(cookie)
+        task_queue.enqueue_ocr_file.assert_called_once_with(
+            args,
+            "/tmp/images with spaces/input image.jpg",
+        )
+
     def test_interactive_cancel_command_cancels_running_and_queued_jobs(self) -> None:
         args = dd.parse_args(["--interactive"])
         task_queue = mock.Mock()
@@ -1287,6 +1311,38 @@ class DouyinDownloaderTests(unittest.TestCase):
         self.assertEqual(task.platform, "x")
         self.assertEqual(task.status, "completed")
 
+    def test_interactive_task_queue_runs_ocr_file_with_snapshotted_settings(self) -> None:
+        args = dd.parse_args(["--interactive", "--ocr-language", "eng"])
+        calls: list[tuple[str, str, bool]] = []
+
+        def ocr_file_handler(current_args: argparse.Namespace) -> int:
+            calls.append(
+                (
+                    current_args.ocr_file,
+                    current_args.ocr_language,
+                    current_args.ocr_preprocess,
+                )
+            )
+            return 0
+
+        with tempfile.TemporaryDirectory() as tmpdir, mock.patch(
+            "sys.stdout",
+            new_callable=io.StringIO,
+        ), mock.patch("sys.stderr", new_callable=io.StringIO):
+            image_path = Path(tmpdir) / "input image.jpg"
+            image_path.write_bytes(b"image")
+            task_queue = dd.InteractiveTaskQueue(ocr_file_handler=ocr_file_handler)
+            task_queue.enqueue_ocr_file(args, str(image_path))
+            args.ocr_language = "chi_sim"
+            args.ocr_preprocess = False
+            task_queue.shutdown(wait=True)
+
+        self.assertEqual(calls, [(str(image_path), "eng", True)])
+        task = task_queue.snapshot()[0]
+        self.assertEqual(task.kind, "ocr_file")
+        self.assertEqual(task.platform, "ocr")
+        self.assertEqual(task.status, "completed")
+
     def test_process_x_file_skips_an_already_compatible_video(self) -> None:
         args = dd.parse_args(["--interactive", "--x-force"])
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1333,6 +1389,34 @@ class DouyinDownloaderTests(unittest.TestCase):
                 self.assertEqual(dd.process_x_file(args), 0)
 
         self.assertEqual(make_compatible.call_args.args[0], video_path)
+
+    def test_process_ocr_file_finds_bare_filename_in_output_directory(self) -> None:
+        args = dd.parse_args(["--interactive", "--ocr-language", "eng", "--no-ocr-preprocess"])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_directory = Path(tmpdir)
+            image_path = script_directory / "downloads" / "downloaded.jpg"
+            image_path.parent.mkdir()
+            image_path.write_bytes(b"image")
+            output_path = image_path.with_name("downloaded_ocr.txt")
+            args.ocr_file = image_path.name
+            with mock.patch.object(
+                dd,
+                "SCRIPT_DIRECTORY",
+                script_directory,
+            ), mock.patch(
+                "media_downloader.image_ocr.ocr_images",
+                return_value=output_path,
+            ) as ocr_images, mock.patch(
+                "sys.stdout",
+                new_callable=io.StringIO,
+            ) as stdout:
+                self.assertEqual(dd.process_ocr_file(args), 0)
+
+        self.assertEqual(ocr_images.call_args.args[0], [image_path])
+        self.assertEqual(ocr_images.call_args.kwargs["language"], "eng")
+        self.assertFalse(ocr_images.call_args.kwargs["preprocess"])
+        self.assertTrue(ocr_images.call_args.kwargs["print_progress"])
+        self.assertIn(f"ocr: {output_path}", stdout.getvalue())
 
     def test_interactive_profile_all_modifier_applies_only_to_that_task(self) -> None:
         args = dd.parse_args(["--interactive"])
@@ -1603,6 +1687,7 @@ class DouyinDownloaderTests(unittest.TestCase):
     def test_interactive_completion_candidates(self) -> None:
         self.assertIn(":transcribe ", dd.interactive_completion_candidates(":tr", 1, 3))
         self.assertIn(":queue ", dd.interactive_completion_candidates(":qu", 1, 3))
+        self.assertIn(":ocr-file ", dd.interactive_completion_candidates(":ocr-f", 1, 6))
         self.assertIn(":x-file ", dd.interactive_completion_candidates(":x-f", 1, 4))
         self.assertIn("whisper-model ", dd.interactive_completion_candidates(":set whi", 5, 8))
         self.assertIn("funasr-model ", dd.interactive_completion_candidates(":set fun", 5, 8))
