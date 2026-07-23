@@ -1164,9 +1164,7 @@ def extract_douyin_video_payload_candidates(
 
     quality_ranked: list[Candidate] = []
     for index, candidate in enumerate(candidates):
-        priority = browser_candidate_priority(candidate.url, "douyin", index)
-        if looks_like_video_only_stream_url(candidate.url):
-            priority += 10_000_000
+        priority = douyin_payload_candidate_priority(candidate, index)
         candidate_source = candidate.source
         if not candidate_source.startswith(f"{source}."):
             candidate_source = f"{source}.{candidate_source}"
@@ -1694,6 +1692,28 @@ def browser_candidate_priority(url: str, platform: str, index: int) -> int:
             if value > 0:
                 return max(1, 1_000_000 - min(value, 999_999))
     return 5_000_000 + index
+
+
+def douyin_payload_candidate_priority(candidate: Candidate, index: int) -> int:
+    """Prefer exact structured play addresses over incidental player/CDN URLs."""
+    priority = browser_candidate_priority(candidate.url, "douyin", index)
+    source_name = candidate.source.rsplit(".", 1)[-1]
+    structured_source = source_name.startswith(
+        (
+            "bit_rate[",
+            "play_addr",
+            "play_api",
+            "download_addr",
+        )
+    )
+    if not structured_source:
+        # Arbitrary URL strings in an exact item payload may include the web
+        # player's already-watermarked or truncated rendition. Structured
+        # play_addr/bit_rate entries describe the actual work media.
+        priority += 20_000_000
+    if looks_like_video_only_stream_url(candidate.url):
+        priority += 10_000_000
+    return priority
 
 
 def browser_candidate_matches_item(url: str, item_id: str | None) -> bool:
@@ -2330,9 +2350,7 @@ def extract_douyin_profile_video_candidates(video_payload: dict[str, Any]) -> li
         )
     quality_ranked: list[Candidate] = []
     for index, candidate in enumerate(candidates):
-        priority = browser_candidate_priority(candidate.url, "douyin", index)
-        if looks_like_video_only_stream_url(candidate.url):
-            priority += 10_000_000
+        priority = douyin_payload_candidate_priority(candidate, index)
         quality_ranked.append(
             Candidate(
                 candidate.url,

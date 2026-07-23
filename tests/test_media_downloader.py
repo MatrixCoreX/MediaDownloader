@@ -623,6 +623,29 @@ class DouyinDownloaderTests(unittest.TestCase):
 
         self.assertEqual([candidate.url for candidate in candidates], [high, low, silent])
 
+    def test_douyin_payload_prefers_structured_playback_over_watermarked_player_url(self) -> None:
+        structured = (
+            "https://www.douyin.com/aweme/v1/play/"
+            "?video_id=original&watermark=0"
+        )
+        player_url = (
+            "https://v26-web.douyinvod.com/video/tos/cn/player/"
+            "?br=5000&mime_type=video_mp4"
+        )
+
+        candidates = dd.extract_douyin_video_payload_candidates(
+            {
+                "bit_rate": [{"play_addr": {"url_list": [structured]}}],
+                "misc_download_addr": {"url_list": [player_url]},
+            },
+            source="douyin.browser-item",
+        )
+
+        self.assertEqual(candidates[0].url, structured)
+        self.assertEqual(candidates[0].source, "douyin.browser-item.bit_rate[0]")
+        self.assertEqual(candidates[1].url, player_url)
+        self.assertEqual(candidates[1].source, "douyin.browser-item.video-url")
+
     def test_douyin_browser_target_uses_jingxuan_modal_route_as_fallback(self) -> None:
         original = "https://www.douyin.com/video/7441234567890123456"
         self.assertEqual(
