@@ -12,7 +12,9 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
+
+from task_cancellation import CancellationToken, OperationCancelled
 
 
 DEFAULT_DOWNLOAD_DIR = "downloads"
@@ -30,6 +32,7 @@ DEFAULT_FUNASR_VAD_MODEL = "fsmn-vad"
 DEFAULT_FUNASR_PUNC_MODEL = None
 DEFAULT_FUNASR_BATCH_SIZE_S = 60
 DEFAULT_FUNASR_RICH_TEXT = False
+DEFAULT_SIMPLIFY_CHINESE = True
 FUNASR_RICH_TAG_RE = re.compile(r"<\|[^|>]+?\|>")
 FUNASR_RICH_MARKER_RE = re.compile(
     "["
@@ -294,6 +297,36 @@ def build_extract_audio_command(
     ]
 
 
+def probe_audio_stream(input_path: Path) -> bool | None:
+    """Return whether ffprobe finds an audio stream, or None when probing is unavailable."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        completed = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+                str(input_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return bool(completed.stdout.strip())
+
+
 def render_progress_bar(percent: int, *, width: int = 30) -> str:
     clamped = max(0, min(percent, 100))
     filled = round(width * clamped / 100)
@@ -303,6 +336,10 @@ def render_progress_bar(percent: int, *, width: int = 30) -> str:
 def print_progress_bar(percent: int, *, interactive: bool) -> None:
     line = render_progress_bar(percent)
     if interactive:
+        progress_writer = getattr(sys.stderr, "write_progress", None)
+        if callable(progress_writer):
+            progress_writer(line)
+            return
         print(f"\r{line}", end="", file=sys.stderr, flush=True)
         return
     print(line, file=sys.stderr, flush=True)
@@ -310,49 +347,91 @@ def print_progress_bar(percent: int, *, interactive: bool) -> None:
 
 def finish_progress_bar(*, interactive: bool) -> None:
     if interactive:
+        progress_finisher = getattr(sys.stderr, "finish_progress", None)
+        if callable(progress_finisher):
+            progress_finisher()
+            return
         print(file=sys.stderr, flush=True)
 
 
-def run_streaming_command(command: list[str], *, verbose: bool) -> subprocess.CompletedProcess[str]:
+def run_streaming_command(
+    command: list[str],
+    *,
+    verbose: bool,
+    cancel_token: CancellationToken | None = None,
+) -> subprocess.CompletedProcess[str]:
     output_parts: list[str] = []
     last_progress = 0
     interactive_progress = sys.stderr.isatty()
     print_progress_bar(0, interactive=interactive_progress)
+    if cancel_token is not None:
+        cancel_token.raise_if_cancelled()
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        start_new_session=os.name == "posix",
     )
-    assert process.stdout is not None
-    for line in process.stdout:
-        output_parts.append(line)
-        match = WHISPER_PROGRESS_RE.search(line)
-        if match:
-            progress = max(0, min(int(match.group(1)), 100))
-            if progress != last_progress:
-                print_progress_bar(progress, interactive=interactive_progress)
-                last_progress = progress
-            continue
-        if verbose:
-            print(line, end="", file=sys.stderr, flush=True)
+    try:
+        if cancel_token is not None:
+            cancel_token.register_process(process)
+        assert process.stdout is not None
+        for line in process.stdout:
+            output_parts.append(line)
+            match = WHISPER_PROGRESS_RE.search(line)
+            if match:
+                progress = max(0, min(int(match.group(1)), 100))
+                if progress != last_progress:
+                    print_progress_bar(progress, interactive=interactive_progress)
+                    last_progress = progress
+                continue
+            if verbose:
+                print(line, end="", file=sys.stderr, flush=True)
 
-    returncode = process.wait()
-    if returncode == 0 and last_progress < 100:
-        print_progress_bar(100, interactive=interactive_progress)
-    finish_progress_bar(interactive=interactive_progress)
+        returncode = process.wait()
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+        if returncode == 0 and last_progress < 100:
+            print_progress_bar(100, interactive=interactive_progress)
+    finally:
+        if cancel_token is not None:
+            cancel_token.unregister_process(process)
+        finish_progress_bar(interactive=interactive_progress)
     return subprocess.CompletedProcess(command, returncode, "", "".join(output_parts))
 
 
-def run_command(command: list[str], *, verbose: bool, stream_output: bool = False) -> subprocess.CompletedProcess[str]:
+def run_command(
+    command: list[str],
+    *,
+    verbose: bool,
+    stream_output: bool = False,
+    cancel_token: CancellationToken | None = None,
+) -> subprocess.CompletedProcess[str]:
     if verbose:
         print(" ".join(command), file=sys.stderr)
     if stream_output:
-        return run_streaming_command(command, verbose=verbose)
-    if verbose:
-        return subprocess.run(command, check=False, text=True)
-    return subprocess.run(command, check=False, capture_output=True, text=True)
+        return run_streaming_command(command, verbose=verbose, cancel_token=cancel_token)
+    if cancel_token is not None:
+        cancel_token.raise_if_cancelled()
+    process = subprocess.Popen(
+        command,
+        stdout=None if verbose else subprocess.PIPE,
+        stderr=None if verbose else subprocess.PIPE,
+        text=True,
+        start_new_session=os.name == "posix",
+    )
+    try:
+        if cancel_token is not None:
+            cancel_token.register_process(process)
+        stdout, stderr = process.communicate()
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+    finally:
+        if cancel_token is not None:
+            cancel_token.unregister_process(process)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def command_error(command_name: str, completed: subprocess.CompletedProcess[str]) -> VideoTranscribeError:
@@ -379,6 +458,7 @@ def extract_audio(
     reuse_audio: bool = False,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
     channels: int = DEFAULT_CHANNELS,
+    cancel_token: CancellationToken | None = None,
     verbose: bool = False,
 ) -> Path:
     if not input_path.exists():
@@ -388,6 +468,8 @@ def extract_audio(
             return audio_path
         if not overwrite:
             raise VideoTranscribeError(f"Audio output already exists, pass --overwrite to replace it: {audio_path}")
+    if probe_audio_stream(input_path) is False:
+        raise VideoTranscribeError(f"Input media contains no audio stream: {input_path}")
 
     audio_path.parent.mkdir(parents=True, exist_ok=True)
     command = build_extract_audio_command(
@@ -398,7 +480,11 @@ def extract_audio(
         sample_rate=sample_rate,
         channels=channels,
     )
-    completed = run_command(command, verbose=verbose)
+    try:
+        completed = run_command(command, verbose=verbose, cancel_token=cancel_token)
+    except OperationCancelled:
+        audio_path.unlink(missing_ok=True)
+        raise
     if completed.returncode != 0:
         raise command_error("ffmpeg", completed)
     if not audio_path.exists():
@@ -460,6 +546,8 @@ def transcribe_audio(
     no_timestamps: bool = False,
     print_progress: bool = True,
     fast: bool = False,
+    simplify_chinese: bool = DEFAULT_SIMPLIFY_CHINESE,
+    cancel_token: CancellationToken | None = None,
     overwrite: bool = False,
     verbose: bool = False,
 ) -> Path:
@@ -480,11 +568,23 @@ def transcribe_audio(
         print_progress=print_progress,
         fast=fast,
     )
-    completed = run_command(command, verbose=verbose, stream_output=print_progress)
+    run_kwargs: dict[str, Any] = {
+        "verbose": verbose,
+        "stream_output": print_progress,
+    }
+    if cancel_token is not None:
+        run_kwargs["cancel_token"] = cancel_token
+    try:
+        completed = run_command(command, **run_kwargs)
+    except OperationCancelled:
+        transcript_path.unlink(missing_ok=True)
+        raise
     if completed.returncode != 0:
         raise command_error("whisper.cpp", completed)
     if not transcript_path.exists():
         raise VideoTranscribeError(f"whisper.cpp completed but did not create transcript: {transcript_path}")
+    if simplify_chinese:
+        simplify_transcript_file(transcript_path)
     return transcript_path
 
 
@@ -529,6 +629,35 @@ def postprocess_funasr_text(text: str, *, rich_text: bool = DEFAULT_FUNASR_RICH_
     return processed
 
 
+def convert_chinese_to_simplified(text: str) -> str:
+    try:
+        from opencc import OpenCC
+    except ImportError as exc:
+        raise VideoTranscribeError(
+            "OpenCC is required for simplified Chinese transcript output. "
+            "Install it with: python -m pip install opencc-python-reimplemented, "
+            "or pass --no-simplify-chinese."
+        ) from exc
+    try:
+        return OpenCC("t2s").convert(text)
+    except Exception as exc:
+        raise VideoTranscribeError(f"OpenCC traditional-to-simplified conversion failed: {exc}") from exc
+
+
+def simplify_transcript_file(transcript_path: Path) -> Path:
+    try:
+        original = transcript_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise VideoTranscribeError(f"Could not read transcript for OpenCC conversion: {transcript_path}") from exc
+    simplified = convert_chinese_to_simplified(original)
+    if simplified != original:
+        try:
+            transcript_path.write_text(simplified, encoding="utf-8")
+        except OSError as exc:
+            raise VideoTranscribeError(f"Could not write simplified transcript: {transcript_path}") from exc
+    return transcript_path
+
+
 def transcribe_audio_with_funasr(
     audio_path: Path,
     transcript_path: Path,
@@ -539,11 +668,15 @@ def transcribe_audio_with_funasr(
     punc_model: str | None = DEFAULT_FUNASR_PUNC_MODEL,
     batch_size_s: int = DEFAULT_FUNASR_BATCH_SIZE_S,
     rich_text: bool = DEFAULT_FUNASR_RICH_TEXT,
+    simplify_chinese: bool = DEFAULT_SIMPLIFY_CHINESE,
+    cancel_token: CancellationToken | None = None,
     overwrite: bool = False,
     verbose: bool = False,
 ) -> Path:
     if not audio_path.exists():
         raise VideoTranscribeError(f"Audio file does not exist: {audio_path}")
+    if cancel_token is not None:
+        cancel_token.raise_if_cancelled()
     prepare_transcript_output(transcript_path, overwrite=overwrite)
 
     try:
@@ -574,12 +707,18 @@ def transcribe_audio_with_funasr(
             batch_size_s=batch_size_s,
             use_itn=True,
         )
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
+    except OperationCancelled:
+        raise
     except Exception as exc:
         raise VideoTranscribeError(f"FunASR failed: {exc}") from exc
 
     text = postprocess_funasr_text(extract_funasr_text(result), rich_text=rich_text)
     if not text:
         raise VideoTranscribeError("FunASR completed but returned no transcript text")
+    if simplify_chinese:
+        text = convert_chinese_to_simplified(text)
     transcript_path.write_text(text + "\n", encoding="utf-8")
     return transcript_path
 
@@ -604,6 +743,8 @@ def transcribe_audio_with_engine(
     funasr_punc_model: str | None = DEFAULT_FUNASR_PUNC_MODEL,
     funasr_batch_size_s: int = DEFAULT_FUNASR_BATCH_SIZE_S,
     funasr_rich_text: bool = DEFAULT_FUNASR_RICH_TEXT,
+    simplify_chinese: bool = DEFAULT_SIMPLIFY_CHINESE,
+    cancel_token: CancellationToken | None = None,
     overwrite: bool = False,
     verbose: bool = False,
 ) -> Path:
@@ -625,6 +766,8 @@ def transcribe_audio_with_engine(
             no_timestamps=no_timestamps,
             print_progress=print_progress,
             fast=fast,
+            simplify_chinese=simplify_chinese,
+            cancel_token=cancel_token,
             overwrite=overwrite,
             verbose=verbose,
         )
@@ -638,6 +781,8 @@ def transcribe_audio_with_engine(
             punc_model=funasr_punc_model,
             batch_size_s=funasr_batch_size_s,
             rich_text=funasr_rich_text,
+            simplify_chinese=simplify_chinese,
+            cancel_token=cancel_token,
             overwrite=overwrite,
             verbose=verbose,
         )
@@ -669,6 +814,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-gpu", action="store_true", help="Pass --no-gpu to whisper.cpp.")
     parser.add_argument("--timestamps", action="store_true", help="Keep timestamps in whisper.cpp text output.")
     parser.add_argument("--no-progress", dest="progress", action="store_false", default=True, help="Disable whisper.cpp progress output.")
+    simplify_group = parser.add_mutually_exclusive_group()
+    simplify_group.add_argument(
+        "--simplify-chinese",
+        dest="simplify_chinese",
+        action="store_true",
+        default=DEFAULT_SIMPLIFY_CHINESE,
+        help="Convert transcript text from traditional to simplified Chinese with OpenCC. Default: enabled",
+    )
+    simplify_group.add_argument(
+        "--no-simplify-chinese",
+        dest="simplify_chinese",
+        action="store_false",
+        help="Keep the ASR engine's original Chinese script without OpenCC conversion.",
+    )
     parser.add_argument("--extract-only", action="store_true", help="Only extract audio; do not run STT.")
     parser.add_argument("--reuse-audio", action="store_true", help="Reuse existing audio output instead of extracting again.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing audio/transcript outputs.")
@@ -732,6 +891,7 @@ def main(argv: list[str] | None = None) -> int:
             funasr_punc_model=args.funasr_punc_model,
             funasr_batch_size_s=args.funasr_batch_size_s,
             funasr_rich_text=args.funasr_rich_text,
+            simplify_chinese=args.simplify_chinese,
             overwrite=args.overwrite,
             verbose=args.verbose,
         )

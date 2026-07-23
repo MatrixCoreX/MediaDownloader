@@ -1,7 +1,9 @@
 import io
 import os
 import subprocess
+import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -89,6 +91,59 @@ class VideoTranscriberTests(unittest.TestCase):
         self.assertNotIn("\r", stderr.getvalue())
         self.assertEqual(len(stderr.getvalue().splitlines()), 2)
 
+    def test_print_progress_bar_uses_prompt_console_progress_api(self) -> None:
+        class ProgressStream(io.StringIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.progress: list[str] = []
+                self.finished = False
+
+            def write_progress(self, line: str) -> None:
+                self.progress.append(line)
+
+            def finish_progress(self) -> None:
+                self.finished = True
+
+        stderr = ProgressStream()
+        with mock.patch("video_transcriber.sys.stderr", stderr):
+            vt.print_progress_bar(15, interactive=True)
+            vt.finish_progress_bar(interactive=True)
+
+        self.assertEqual(stderr.progress, [vt.render_progress_bar(15)])
+        self.assertTrue(stderr.finished)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_run_command_cancellation_terminates_active_child_process(self) -> None:
+        token = vt.CancellationToken()
+        registered = threading.Event()
+        errors: list[BaseException] = []
+        original_register = token.register_process
+
+        def register(process: subprocess.Popen[object]) -> None:
+            original_register(process)
+            registered.set()
+
+        def run_child() -> None:
+            try:
+                vt.run_command(
+                    [sys.executable, "-c", "import time; time.sleep(30)"],
+                    verbose=False,
+                    cancel_token=token,
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch.object(token, "register_process", side_effect=register):
+            worker = threading.Thread(target=run_child)
+            worker.start()
+            self.assertTrue(registered.wait(2))
+            token.cancel()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], vt.OperationCancelled)
+
     def test_build_extract_audio_command_uses_whisper_friendly_wav(self) -> None:
         command = vt.build_extract_audio_command(
             "ffmpeg",
@@ -104,6 +159,29 @@ class VideoTranscriberTests(unittest.TestCase):
         self.assertIn("pcm_s16le", command)
         self.assertIn("16000", command)
         self.assertEqual(command[-1], "input_audio.wav")
+
+    def test_probe_audio_stream_detects_present_and_missing_audio(self) -> None:
+        with mock.patch("video_transcriber.shutil.which", return_value="/usr/bin/ffprobe"), mock.patch(
+            "video_transcriber.subprocess.run",
+            side_effect=[
+                subprocess.CompletedProcess(["ffprobe"], 0, "1\n", ""),
+                subprocess.CompletedProcess(["ffprobe"], 0, "", ""),
+            ],
+        ):
+            self.assertTrue(vt.probe_audio_stream(Path("with-audio.mp4")))
+            self.assertFalse(vt.probe_audio_stream(Path("video-only.mp4")))
+
+    def test_extract_audio_rejects_input_without_audio_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "video-only.mp4"
+            audio_path = Path(tmpdir) / "video-only_audio.wav"
+            input_path.write_text("video", encoding="utf-8")
+            with mock.patch("video_transcriber.probe_audio_stream", return_value=False), mock.patch(
+                "video_transcriber.run_command",
+            ) as run:
+                with self.assertRaisesRegex(vt.VideoTranscribeError, "contains no audio stream"):
+                    vt.extract_audio(input_path, audio_path)
+            run.assert_not_called()
 
     def test_build_whisper_command_writes_txt_output(self) -> None:
         command = vt.build_whisper_command(
@@ -160,6 +238,23 @@ class VideoTranscriberTests(unittest.TestCase):
         self.assertIn("--best-of", command)
         self.assertIn("--beam-size", command)
         self.assertIn("--no-fallback", command)
+
+    def test_parse_args_enables_simplified_chinese_by_default(self) -> None:
+        self.assertTrue(vt.parse_args([]).simplify_chinese)
+        self.assertFalse(vt.parse_args(["--no-simplify-chinese"]).simplify_chinese)
+        self.assertTrue(vt.parse_args(["--simplify-chinese"]).simplify_chinese)
+
+    def test_convert_chinese_to_simplified_uses_opencc_t2s(self) -> None:
+        self.assertEqual(vt.convert_chinese_to_simplified("臺灣軟體裡面"), "台湾软体里面")
+
+    def test_simplify_transcript_file_rewrites_utf8_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript_path = Path(tmpdir) / "video_transcript.txt"
+            transcript_path.write_text("這是一段繁體文字。\n", encoding="utf-8")
+
+            self.assertEqual(vt.simplify_transcript_file(transcript_path), transcript_path)
+
+            self.assertEqual(transcript_path.read_text(encoding="utf-8"), "这是一段繁体文字。\n")
 
     def test_find_whisper_binary_uses_rustclaw_home(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -233,7 +328,7 @@ class VideoTranscriberTests(unittest.TestCase):
             audio_path.write_text("audio", encoding="utf-8")
 
             def fake_run(command: list[str], *, verbose: bool, stream_output: bool = False) -> subprocess.CompletedProcess[str]:
-                transcript_path.write_text("hello", encoding="utf-8")
+                transcript_path.write_text("這是軟體。", encoding="utf-8")
                 self.assertTrue(stream_output)
                 return subprocess.CompletedProcess(command, 0, "", "")
 
@@ -247,6 +342,7 @@ class VideoTranscriberTests(unittest.TestCase):
                     ),
                     transcript_path,
                 )
+            self.assertEqual(transcript_path.read_text(encoding="utf-8"), "这是软体。")
 
     def test_extract_funasr_text_handles_common_result_shapes(self) -> None:
         self.assertEqual(vt.extract_funasr_text("hello"), "hello")
@@ -282,7 +378,7 @@ class VideoTranscriberTests(unittest.TestCase):
 
             def generate(self, **kwargs: object) -> list[dict[str, str]]:
                 calls["generate_kwargs"] = kwargs
-                return [{"text": "<|zh|><|NEUTRAL|>你好，世界。"}]
+                return [{"text": "<|zh|><|NEUTRAL|>你好，世界。這是軟體。"}]
 
         fake_funasr = types.ModuleType("funasr")
         fake_funasr.__path__ = []  # type: ignore[attr-defined]
@@ -314,7 +410,7 @@ class VideoTranscriberTests(unittest.TestCase):
                     transcript_path,
                 )
 
-            self.assertEqual(transcript_path.read_text(encoding="utf-8"), "您好，世界。\n")
+            self.assertEqual(transcript_path.read_text(encoding="utf-8"), "您好，世界。这是软体。\n")
             self.assertEqual(
                 calls["model_kwargs"],
                 {"model": "iic/SenseVoiceSmall", "device": "cpu", "vad_model": "fsmn-vad"},
@@ -340,6 +436,7 @@ class VideoTranscriberTests(unittest.TestCase):
                         engine="funasr",
                         funasr_model="local-model",
                         funasr_device="cpu",
+                        simplify_chinese=False,
                     ),
                     transcript_path,
                 )
@@ -347,6 +444,7 @@ class VideoTranscriberTests(unittest.TestCase):
             self.assertEqual(funasr.call_args.args[:2], (audio_path, transcript_path))
             self.assertEqual(funasr.call_args.kwargs["model"], "local-model")
             self.assertEqual(funasr.call_args.kwargs["device"], "cpu")
+            self.assertFalse(funasr.call_args.kwargs["simplify_chinese"])
 
     def test_main_transcribes_wav_input_directly(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

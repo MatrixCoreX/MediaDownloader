@@ -64,6 +64,7 @@ python3 media_downloader.py "https://www.xiaohongshu.com/discovery/item/xxxx"
 | 文件 | 作用 |
 | --- | --- |
 | `media_downloader.py` | 主入口。负责读取分享内容、识别平台、解析候选媒体地址、下载文件，并可选调用转码或转写。 |
+| `browser_devtools.py` | 仅使用 Python 标准库连接本机 Chrome DevTools，用于抖音和小红书主页滚动分页。 |
 | `image_ocr.py` | 本地图片 OCR 工具。使用系统里的 `tesseract` 命令识别图片文字，可以被主下载器调用，也可以单独处理本地图片。 |
 | `video_transcriber.py` | 本地音频拆分与语音转文字工具。可以被主下载器调用，也可以单独处理本地视频/音频文件。 |
 | `x_transcoder.py` | X/Twitter 上传兼容性检查与转码工具。可以被主下载器调用，也可以单独处理本地视频。 |
@@ -74,15 +75,15 @@ python3 media_downloader.py "https://www.xiaohongshu.com/discovery/item/xxxx"
 
 | 平台参数 | 支持媒体 | 常见链接域名 | 说明 |
 | --- | --- | --- | --- |
-| `douyin` | 抖音公开视频、公开图文作品图片 | `douyin.com`、`iesdouyin.com` | 支持从页面状态、接口数据和浏览器 fallback 中提取候选地址。 |
+| `douyin` | 抖音公开视频、公开图文作品图片、动态照片视频、用户主页最近作品 | `douyin.com`、`v.douyin.com`、`iesdouyin.com` | 单作品兼容手机 App 整段分享文案/短链以及电脑端 `/video/`、`/note/`、`jingxuan?modal_id=` 链接；`/user/` 主页支持视频和图文限量、限速顺序下载。 |
 | `kuaishou` | 快手公开视频 | `kuaishou.com`、`v.kuaishou.com`、`ksurl.cn`、`gifshow.com`、`kwai.com` | 支持公开短视频分享链接。 |
-| `xiaohongshu` | 小红书视频笔记、公开图文作品图片 | `xiaohongshu.com`、`xhslink.com`、`xhs.cn`、`xhscdn.com` | 图文笔记会保存为图片序列，视频笔记保存为视频。 |
+| `xiaohongshu` | 小红书视频笔记、公开图文作品图片、用户主页作品 | `xiaohongshu.com`、`xhslink.com`、`xhs.cn`、`xhscdn.com` | 图文笔记保存为图片序列，视频保存为视频；`/user/profile/` 支持限量或全部增量下载。 |
 | `tiktok` | TikTok 公开视频 | `tiktok.com`、`vm.tiktok.com`、`vt.tiktok.com`、`tiktokcdn.com` | 会延续页面响应下发的临时 cookie 到同次视频下载请求。 |
 | `youtube` | YouTube 公开视频和 Shorts | `youtube.com`、`youtu.be`、`youtube-nocookie.com` | 使用本机 `yt-dlp` 下载，支持后续转写、转码和媒体信息。 |
 
 默认平台模式是 `--platform auto`，会根据分享链接自动识别平台。除 YouTube 交给本机 `yt-dlp` 外，其它平台都使用本项目内置解析逻辑；不调用第三方解析网站。
 
-抖音等页面如果不再把公开视频地址直接写在 HTML/API 里，脚本会默认启动本机 Chromium 系浏览器无头模式，读取本机网络日志中的公开视频请求地址作为 fallback。这仍然不调用第三方解析网站。
+抖音等页面如果不再把公开视频地址直接写在 HTML/API 里，脚本会默认启动本机 Chromium 系浏览器无头模式。抖音会优先读取与目标作品 ID 精确匹配的结构化作品数据：普通图文下载完整图片数组；动态照片下载图片项内嵌的画面片段和完整音轨，再按作品播放区间用 FFmpeg 重建完整 MP4；普通视频从该作品自己的候选中选择最高码率。结构化数据不可用时才回退到页面和网络媒体请求。这仍然不调用第三方解析网站。
 
 支持范围只包含当前用户可以正常访问的公开内容。脚本不会破解 DRM、不会绕过私密作品权限、不会移除已下载文件上的水印，也不会处理付费或未授权内容。
 
@@ -166,7 +167,9 @@ python3 media_downloader.py
 python3 media_downloader.py --interactive
 ```
 
-启动后粘贴分享文案并回车，下载完成后会继续回到输入提示符。输入 `exit`、`quit` 或 `q` 退出。终端里可以用方向键上/下翻看历史输入，Tab 可以补齐交互命令和参数名；有多个匹配项时，终端会显示候选列表。历史默认保存到 `~/.media_downloader_history`；也可以用环境变量 `MEDIA_DOWNLOADER_HISTORY` 指定历史文件路径。
+启动后粘贴分享文案并回车，任务会立即进入后台队列，输入提示符不会等待下载结束，可以继续粘贴下一条。支持 readline 的终端会在后台日志输出后重绘提示符以及尚未提交的输入，使 `media>` 输入行保持在日志下方；转写百分比会在输入框上一行原地刷新，不会为每个百分比新增一行。后台只有一个工作线程，任务严格按入队顺序逐个处理，并打印 `task_queued`、`task_started`、下载/解析流程以及 `task_completed`、`task_cancelled` 或 `task_failed`。输入 `:queue` 或 `:jobs` 可以随时查看任务列表；输入 `:cancel` 会终止当前任务并取消所有尚未开始的任务，之后仍可继续添加新任务。
+
+每个任务会保存入队当时的配置和 Cookie；入队后再用 `:set`、`:on` 等命令修改配置，只影响后续新任务。输入 `exit`、`quit` 或 `q` 后停止接收新任务，并等待已经排队的任务处理完成再退出，避免中断正在写入的文件。终端里可以用方向键上/下翻看历史输入，Tab 可以补齐交互命令和参数名；有多个匹配项时，终端会显示候选列表。历史默认保存到 `~/.media_downloader_history`；也可以用环境变量 `MEDIA_DOWNLOADER_HISTORY` 指定历史文件路径。
 
 交互模式里可以用 `:` 或 `/` 开头的命令临时修改后续下载参数。常用命令：
 
@@ -174,6 +177,12 @@ python3 media_downloader.py --interactive
 :help
 :status
 :history
+:queue
+:cancel
+:x-file "input.mp4"
+:x-file "/path/to/input video.mp4"
+:x-folder "/path/to/videos"
+:x "/path/to/videos"
 :on transcribe
 :off transcribe
 :toggle verbose
@@ -185,7 +194,7 @@ python3 media_downloader.py --interactive
 :quit
 ```
 
-布尔参数也支持快捷写法，例如 `:transcribe on`、`:extract-audio off`、`:x-compatible toggle`。路径、平台、超时、whisper 模型等参数支持 `:set 参数名 值`；输入 `:status` 可以查看当前配置。
+`:x-file 视频路径` 会手动指定一个本地视频加入 X 兼容处理队列。绝对路径直接使用；只写文件名或相对路径时，会先从 `media_downloader.py` 所在目录查找，找不到再从当前 `output-dir`（默认 `downloads/`）查找。`:x-folder 文件夹` 会递归处理整个文件夹，`:x 文件夹` 是文件夹模式的简写。任务会保存入队时的 X 参数设置；已兼容文件始终跳过，不会生成副本。布尔参数也支持快捷写法，例如 `:transcribe on`、`:extract-audio off`、`:x-compatible toggle`。路径、平台、超时、whisper 模型等参数支持 `:set 参数名 值`；输入 `:status` 可以查看当前配置。
 
 `:extract-audio off` 只关闭“单独拆 WAV”功能，不会自动关闭转文字；如果 `:transcribe on` 仍然开启，下载后仍会生成或复用中间 WAV 并继续转文字。要停止转文字，需要执行 `:transcribe off`。`:clear audio-output` 只是清除自定义音频路径，恢复默认 `_audio.wav` 路径。
 
@@ -206,16 +215,17 @@ python3 media_downloader.py --interactive
 交互模式支持的布尔选项：
 
 ```text
-browser-fallback, extract-audio, print-url, save-meta, show-info,
+browser-fallback, system-browser-cookies, extract-audio, print-url, save-meta, show-info,
 ocr-images, ocr-preprocess, transcribe, verbose, funasr-rich-text, whisper-fast,
 whisper-no-gpu, whisper-progress, whisper-timestamps, whisper-translate,
-overwrite, x-compatible, x-force, x-overwrite
+overwrite, simplify-chinese, x-compatible, x-force, x-overwrite
 ```
 
 交互模式支持的取值选项：
 
 ```text
-platform, output-dir, output-name, timeout, browser-timeout, chrome-path,
+platform, output-dir, output-name, timeout, browser-timeout, profile-limit,
+profile-interval, chrome-path,
 cookie, yt-dlp-bin, youtube-format, ocr-output, ocr-language, ocr-bin, ocr-psm,
 ocr-min-line-confidence, audio-output,
 text-output, audio-sample-rate, audio-channels, transcribe-engine,
@@ -240,7 +250,16 @@ python3 media_downloader.py --platform youtube "YouTube 分享链接"
 python3 media_downloader.py --print-url "https://v.douyin.com/xxxx/"
 ```
 
-如果是图文作品，`--print-url` 会按行打印图片地址。
+可以直接粘贴手机 App 复制出的整段文字，不需要手动清理前后的口令；电脑浏览器复制的标准作品页或精选弹窗链接也可以直接输入：
+
+```bash
+python3 media_downloader.py "6.97 复制打开抖音，看看【作者的图文作品】... https://v.douyin.com/xxxx/ 口令..."
+python3 media_downloader.py "https://www.douyin.com/video/7658893225607908651"
+python3 media_downloader.py "https://www.douyin.com/note/7664807527763307958"
+python3 media_downloader.py "https://www.douyin.com/jingxuan?modal_id=7658893225607908651"
+```
+
+如果是普通图文作品，`--print-url` 会按行打印图片地址；标记为动态照片的作品会打印其内嵌画面片段地址。动态照片正常下载时还会获取完整音轨并重建完整时长，单独访问 `--print-url` 输出的片段仍只有原始循环片段长度。
 
 从文件或管道读取：
 
@@ -256,6 +275,60 @@ python3 media_downloader.py -o videos --output-name my_video.mp4 "https://v.douy
 ```
 
 图文作品使用 `--output-name` 时，会取文件名主体作为图片序列前缀。
+
+批量下载抖音或小红书用户主页最近作品。主页任务默认收集最近 100 条视频或图文作品，按发布时间从新到旧顺序下载，并在输出目录下以用户名创建独立文件夹。抖音示例：
+
+```bash
+python3 media_downloader.py \
+  "https://www.douyin.com/user/MS4wLjABAAA...?from_tab_name=main"
+```
+
+小红书示例：
+
+```bash
+python3 media_downloader.py \
+  "https://www.xiaohongshu.com/user/profile/5e1d98150000000001007051?xsec_token=...&xsec_source=pc_search"
+```
+
+输出示例：
+
+```text
+downloads/Miya🦄️/videos/Miya🦄️_2026-07-21_14-32-10.mp4
+downloads/Miya🦄️/images/Miya🦄️_2026-07-20_09-18-05_01.webp
+downloads/Miya🦄️/images/Miya🦄️_2026-07-20_09-18-05_02.webp
+downloads/Miya🦄️/profile_downloads.json
+```
+
+视频和图文图片分别保存在 `videos/`、`images/` 子目录。文件名默认使用“用户名 + 本地发布时间”，精确到秒以避免同一天多条作品重名；同一图文作品有多张图片时追加 `_01`、`_02`。`profile_downloads.json` 会记录每个成功下载的作品 ID、发布时间、下载时间、媒体类型和媒体文件相对路径，不记录 OCR TXT。再次输入同一主页时，清单里已有的作品会直接跳过，只下载最近列表中新出现的作品；每成功一条就立即更新清单，任务中途停止也不会丢失已经完成的记录。
+
+主页视频默认优先选择带音轨的最高码率候选，保留平台提供的原始分辨率，不做二次压缩；图文作品会保存作品内的全部原图候选。
+
+可以调整数量和请求间隔；主页分页和相邻作品下载默认至少间隔 5 秒：
+
+```bash
+python3 media_downloader.py \
+  --profile-limit 20 \
+  --profile-interval 8 \
+  "https://www.douyin.com/user/MS4wLjABAAA...?from_tab_name=main"
+```
+
+下载主页能持续翻页找到的全部作品：
+
+```bash
+python3 media_downloader.py \
+  --profile-limit all \
+  --profile-interval 8 \
+  "https://www.douyin.com/user/MS4wLjABAAA...?from_tab_name=main"
+```
+
+交互模式可以直接在主页链接末尾加 `all`，只对这一条队列任务生效：
+
+```text
+media> https://www.douyin.com/user/MS4wLjABAAA...?from_tab_name=main all
+media> https://www.xiaohongshu.com/user/profile/5e1d98150000000001007051?xsec_token=... all
+```
+
+抖音单作品精确解析、抖音主页和小红书主页可能要求登录态。未传 `--cookie` 时，浏览器收集器默认自动查找与所选 Chrome/Chromium 匹配的本机浏览器配置，只复制当前站点（`douyin.com` 或 `xiaohongshu.com`）的 Cookie 到权限隔离的临时配置，再由浏览器自身解密；不会打印 Cookie 值，也不会修改日常浏览器配置。显式 `--cookie` 始终优先，可用 `--no-system-browser-cookies` 禁止自动读取。
 
 下载后显示媒体信息：
 
@@ -359,7 +432,11 @@ python3 media_downloader.py \
 | `-v`, `--verbose` | 关闭 | 打印解析日志、候选 URL、ffmpeg/ASR 命令等调试信息。 |
 | `--browser-fallback` | 开启 | 直连解析无候选时，启用本机 Chromium 系浏览器 fallback。 |
 | `--no-browser-fallback` | 关闭 | 禁用浏览器 fallback，只走 HTTP 直连解析。 |
+| `--system-browser-cookies` | 开启 | 抖音单作品/主页和小红书主页抓取未显式提供 Cookie 时，自动复用匹配的本机浏览器站点登录态。 |
+| `--no-system-browser-cookies` | 关闭 | 禁止从本机浏览器配置自动读取抖音或小红书 Cookie。 |
 | `--browser-timeout` | `30` | 浏览器 fallback 页面加载等待时间，单位秒。 |
+| `--profile-limit` | `100` | 输入抖音或小红书用户主页时，处理最近 N 条作品；设为 `all` 时持续查找全部可获取作品。 |
+| `--profile-interval` | `5` | 主页分页以及相邻作品下载之间的最小等待秒数，降低连续请求频率。 |
 | `--chrome-path` | 自动查找 | 指定 Chrome/Chromium/Edge/Brave/Vivaldi 可执行文件路径或命令名。 |
 | `--yt-dlp-bin` | 自动查找 | 指定 YouTube 下载使用的 `yt-dlp` 可执行文件路径或命令名。 |
 | `--youtube-format` | MP4 优先 | 传给 `yt-dlp -f` 的格式选择器；默认优先下载 MP4 视频 + M4A 音频。 |
@@ -370,6 +447,7 @@ python3 media_downloader.py \
 | `--audio-sample-rate` | `16000` | 拆 WAV 时使用的采样率。 |
 | `--audio-channels` | `1` | 拆 WAV 时使用的声道数。 |
 | `--x-compatible` | 关闭 | 下载后检查并按需生成 X 兼容 MP4。 |
+| `--x-folder` | 无 | 递归检查指定文件夹中的视频，并仅转码不兼容文件；无需提供分享链接。 |
 | `--x-force` | 关闭 | 和 `--x-compatible` 一起使用，即使原文件已兼容也强制转码。 |
 | `--x-output-dir` | 原文件目录 | X 兼容文件输出目录。 |
 | `--x-overwrite` | 关闭 | 允许覆盖 X 兼容输出文件。 |
@@ -380,6 +458,8 @@ python3 media_downloader.py \
 图片 OCR 使用的是本机 `tesseract` 命令行引擎。主下载器默认会对图文作品下载后的图片做 OCR；视频作品不会触发 OCR。需要关闭时加 `--no-ocr-images`。
 
 OCR 是默认开启的可选后处理：如果本机没有安装 `tesseract` 或语言包缺失，图片仍会正常保存，程序只会向 `stderr` 打印 `warning: Image OCR skipped: ...` 并跳过 OCR。
+
+OCR 执行时会打印 `ocr_progress` 进度条，包含百分比、已完成图片数和当前图片名；交互终端中会在输入框上方原地刷新，普通管道或日志环境中则逐行输出，避免长时间识别时看起来像卡死。
 
 默认语言是 `chi_sim`，用于识别简体中文。默认会把原图和 Pillow 预处理图都交给 Tesseract `psm 6` + LSTM 引擎识别，然后按行级置信度自动选择更好的结果。预处理图会放大 2 倍、增强对比度并转成黑白图，适合大字文字卡片；原图通常更适合长段宋体/衬线字体。识别结果还会通过 Tesseract TSV 行级置信度过滤一次，默认丢弃低于 `15` 的行，减少插画、图标、表情被误识别成文字的情况。识别结果会保存到一个 TXT 文件，路径默认基于图片序列前缀生成：
 
@@ -525,6 +605,31 @@ python3 x_transcoder.py --check downloads/input.mp4
 python3 x_transcoder.py downloads/input.mp4
 ```
 
+递归检查一个文件夹，并批量转换其中不兼容的视频：
+
+```bash
+python3 media_downloader.py --x-folder "/home/guagua/media_download/downloads/Miya🦄️/videos"
+python3 x_transcoder.py "/path/to/videos"
+```
+
+只检查、不转码，或只处理文件夹第一层：
+
+```bash
+python3 x_transcoder.py --check "/path/to/videos"
+python3 x_transcoder.py --no-recursive "/path/to/videos"
+```
+
+交互模式也可以直接把文件夹任务加入后台队列：
+
+```text
+media> :x-file "downloads/input.mp4"
+media> :x-file "/home/guagua/media_download/downloads/input video.mp4"
+media> :x-folder "/home/guagua/media_download/downloads/Miya🦄️/videos"
+media> :x "/path/to/videos"
+```
+
+`:x-file` 和批量模式都会先检查兼容性。已兼容的视频始终跳过，即使开启了 `x-force` 也不会生成副本；不兼容的视频默认在原文件旁生成 `原文件名_x.mp4`。批量模式会逐个打印检查和转换状态，最后打印汇总。普通转码模式不会再次扫描名称已以 `_x` 结尾的结果文件。指定 `--x-output-dir` 或 `--output-dir` 时，会在输出目录内保留输入文件夹的相对子目录结构。
+
 主下载器里启用 `--x-compatible` 时，转码输出默认和原文件同目录，并在原文件名后加 `_x`：
 
 ```text
@@ -558,13 +663,14 @@ downloads/20260624_153012_x.mp4
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `input` | `downloads/` 下最新 MP4/MOV | 要检查或转码的视频。 |
+| `input` | `downloads/` 下最新 MP4/MOV | 要检查或转码的视频或文件夹。 |
 | `-o`, `--output` | 本地时间加 `_x` | 输出文件路径；会补 `.mp4`。 |
 | `--output-dir` | 输入文件目录 | 输出目录；指定 `--output` 时忽略。 |
 | `--downloads-dir` | `downloads` | 未提供输入文件时，从这个目录找最新 MP4/MOV。 |
 | `--suffix` | `_x` | 默认输出文件名后缀。 |
+| `--recursive` / `--no-recursive` | 递归 | 输入为文件夹时，是否扫描所有子文件夹。 |
 | `--check` | 关闭 | 只检查兼容性，不转码。 |
-| `--force` | 关闭 | 即使输入已经兼容也继续转码。 |
+| `--force` | 关闭 | 单文件模式下即使输入已经兼容也继续转码；文件夹模式始终跳过兼容文件。 |
 | `--overwrite` | 关闭 | 允许覆盖输出文件。 |
 | `--crf` | `23` | x264 质量参数，数值越小质量越高、文件越大。 |
 | `--preset` | `medium` | x264 编码预设。 |
@@ -581,9 +687,11 @@ downloads/20260624_153012_x.mp4
 
 ## 本机语音转文字
 
-`video_transcriber.py` 会先用 `ffmpeg` 从视频里拆出单独的 16 kHz 单声道 WAV 音频，再调用本机 ASR 引擎生成文字稿。默认引擎是已有的 `whisper.cpp`；也可以切到 FunASR。
+`video_transcriber.py` 会先用 `ffmpeg` 从视频里拆出单独的 16 kHz 单声道 WAV 音频，再调用本机 ASR 引擎生成文字稿。默认引擎是已有的 `whisper.cpp`；也可以切到 FunASR。转写完成后默认使用 OpenCC `t2s` 把繁体或简繁混合结果统一转换为简体。
 
 主下载器默认只下载视频。只有显式加参数时，才会在同一次运行里下载视频后继续拆音频或转文字。
+
+使用 `--extract-audio` 或 `--transcribe` 时，下载器会先用 `ffprobe` 检查候选文件是否含有音轨。若抖音只返回 `media-video-*` 自适应视频流，下载器会继续尝试其他作品入口和浏览器候选，避免把无音轨 MP4 交给 `ffmpeg`。
 
 如果解析到的是图文作品，`--extract-audio` 和 `--transcribe` 会被忽略，仍只保存图片。
 
@@ -597,6 +705,18 @@ python3 media_downloader.py --extract-audio "https://v.douyin.com/xxxx/"
 
 ```bash
 python3 media_downloader.py --transcribe "https://v.douyin.com/xxxx/"
+```
+
+OpenCC 是默认转写后处理依赖，可以安装到当前 Python 环境：
+
+```bash
+python3 -m pip install -r requirements-transcribe.txt
+```
+
+如果需要保留 ASR 引擎的原始简繁形式，可以关闭转换：
+
+```bash
+python3 media_downloader.py --transcribe --no-simplify-chinese "https://v.douyin.com/xxxx/"
 ```
 
 转文字时默认会打印 whisper.cpp 的进度。默认线程数会按本机 CPU 自动选择，并最多使用 8 个线程；也可以手动指定：
@@ -650,7 +770,7 @@ bash install_funasr.sh --preload-models
 python media_downloader.py --transcribe --transcribe-engine funasr "https://v.douyin.com/xxxx/"
 ```
 
-不强制必须是 `.venv`，但运行脚本的 Python 环境必须已经安装 `funasr`、`modelscope`、`torch`、`torchaudio`。如果这些包安装在 conda 环境里，就用 conda 环境里的 `python`；如果安装在项目 `.venv` 里，就用 `.venv/bin/python`。
+不强制必须是 `.venv`，但运行脚本的 Python 环境必须已经安装 `funasr`、`modelscope`、`torch`、`torchaudio` 和 `opencc-python-reimplemented`。如果这些包安装在 conda 环境里，就用 conda 环境里的 `python`；如果安装在项目 `.venv` 里，就用 `.venv/bin/python`。
 
 如果脚本检测到 GPU 并安装了 CUDA 版 PyTorch，运行时可以把 `--funasr-device` 改成 `cuda:0`。
 
@@ -830,6 +950,8 @@ FunASR 安装脚本参数：
 | `--whisper-no-gpu` | 关闭 | 向 whisper.cpp 传 `--no-gpu`。 |
 | `--whisper-timestamps` | 关闭 | 保留 whisper.cpp 文本输出中的时间戳。 |
 | `--whisper-no-progress` | 关闭 | 不显示 whisper.cpp 转写进度。 |
+| `--simplify-chinese` | 开启 | 转写后使用 OpenCC `t2s` 将繁体或简繁混合文字统一为简体。 |
+| `--no-simplify-chinese` | 关闭 | 禁用 OpenCC 转换，保留 ASR 原始输出。 |
 | `--funasr-model` | `iic/SenseVoiceSmall` | FunASR 模型 ID 或本地路径。 |
 | `--funasr-device` | `cpu` | FunASR 运行设备，例如 `cpu` 或 `cuda:0`。 |
 | `--funasr-vad-model` | `fsmn-vad` | FunASR VAD 模型；可用 `none` 或 `off` 关闭。 |
@@ -850,12 +972,16 @@ FunASR 安装脚本参数：
 | `--whisper-no-gpu` | `--no-gpu` |
 | `--whisper-timestamps` | `--timestamps` |
 | `--whisper-no-progress` | `--no-progress` |
+| `--simplify-chinese` | `--simplify-chinese` |
+| `--no-simplify-chinese` | `--no-simplify-chinese` |
 | `--audio-sample-rate` | `--sample-rate` |
 | `--audio-channels` | `--channels` |
 
 ## 浏览器 fallback
 
 默认启用本机 Chromium 系浏览器 fallback。支持 Chrome、Chromium、Microsoft Edge、Brave、Vivaldi 等 Chromium 系浏览器。
+
+抖音 fallback 会先从手机整段分享文字中提取短链并解析最终作品页，也接受电脑端 `/video/`、`/note/` 和 `jingxuan?modal_id=...`。浏览器响应中的作品对象必须与请求的作品 ID 完全一致：普通图文读取该对象的完整 `images` 数组；当 `is_live_photo` 或图片的 `live_photo_type` 被标记时，读取对应图片项内嵌的短画面、作品完整音轨和 `image_album_music_info` 播放区间，再循环画面并合成完整 MP4；普通视频只读取该对象的 `video` 候选并优先带音轨的最高码率。只有精确作品数据不可用时，才继续尝试其它标准/精选入口和网络媒体回退。
 
 禁用浏览器 fallback，只使用纯 HTTP 直连解析：
 
@@ -881,7 +1007,7 @@ python3 media_downloader.py --cookie cookies.txt "https://v.douyin.com/xxxx/"
 
 `--cookie` 可以传原始 Cookie 字符串，也可以传保存 Cookie 的文本文件路径。
 
-浏览器 fallback 当前使用临时浏览器配置，不会自动读取你日常 Chrome 的登录状态。
+浏览器 fallback 始终使用用完即删的临时配置。抖音单作品精确解析、抖音主页和小红书主页收集在没有显式 `--cookie` 时，会只复制系统浏览器配置中对应站点的 Cookie 到该临时配置；显式 Cookie 仍优先用于 HTTP 解析、浏览器访问、媒体下载和主页分页数据访问。
 
 解析 TikTok 公开页时，脚本会自动把页面响应下发的临时 cookie 延续到同次视频下载请求；这些临时 cookie 不会写入 metadata。
 
@@ -898,8 +1024,8 @@ python3 media_downloader.py --cookie cookies.txt "https://v.douyin.com/xxxx/"
 | `--ocr-images` / `image_ocr.py` | `tesseract` 命令行程序、需要的语言数据，例如 `chi_sim`、`eng`；图片预处理需要 Python Pillow，缺失时会自动回退到原图。 |
 | `--x-compatible` / `x_transcoder.py` | `ffmpeg` 和 `ffprobe`。 |
 | `--extract-audio` / `video_transcriber.py` | `ffmpeg`。 |
-| `--transcribe` + `whisper` | `ffmpeg`、本机 `whisper.cpp` 可执行文件、ggml 模型文件。 |
-| `--transcribe` + `funasr` | `ffmpeg`，以及运行脚本的 Python 环境里安装 `funasr`、`modelscope`、`torch`、`torchaudio`。 |
+| `--transcribe` + `whisper` | `ffmpeg`、本机 `whisper.cpp` 可执行文件、ggml 模型文件；默认简体转换需要 `opencc-python-reimplemented`。 |
+| `--transcribe` + `funasr` | `ffmpeg`，以及运行脚本的 Python 环境里安装 `funasr`、`modelscope`、`torch`、`torchaudio`、`opencc-python-reimplemented`。 |
 
 Debian/Ubuntu 示例：
 
@@ -931,7 +1057,7 @@ bash install_funasr.sh
 也可以安装到你自己的 conda 或系统 Python 环境。无论使用哪种方式，都要保证运行 `media_downloader.py` 或 `video_transcriber.py` 的那个 `python` 能导入 FunASR：
 
 ```bash
-python -c "import funasr, modelscope, torch, torchaudio; print('ok')"
+python -c "import funasr, modelscope, opencc, torch, torchaudio; print('ok')"
 ```
 
 ## 测试

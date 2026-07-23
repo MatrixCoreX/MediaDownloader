@@ -9,9 +9,12 @@ const DEFAULTS = {
   outputDir: "downloads",
   outputName: "",
   cookie: "",
+  systemBrowserCookies: true,
   timeout: 20,
   browserFallback: true,
   browserTimeout: 30,
+  profileLimit: 100,
+  profileInterval: 5,
   chromePath: "",
   ytDlpBin: "",
   youtubeFormat: "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
@@ -28,6 +31,7 @@ const DEFAULTS = {
   ocrBin: "",
   extractAudio: false,
   transcribe: false,
+  simplifyChinese: true,
   audioSampleRate: 16000,
   audioChannels: 1,
   audioOutput: "",
@@ -447,6 +451,10 @@ function DownloadSettings({ settings, update }) {
         <NumberField label="超时秒数" value={settings.timeout} onChange={(value) => update("timeout", value)} />
         <NumberField label="浏览器秒数" value={settings.browserTimeout} onChange={(value) => update("browserTimeout", value)} />
       </div>
+      <div className="field-grid two">
+        <TextField label="主页抓取上限（数字或 all）" value={settings.profileLimit} onChange={(value) => update("profileLimit", value)} />
+        <NumberField label="主页请求间隔（秒）" value={settings.profileInterval} onChange={(value) => update("profileInterval", value)} />
+      </div>
       <TextField label="Chrome 路径" value={settings.chromePath} placeholder="自动查找" onChange={(value) => update("chromePath", value)} />
       <TextField label="yt-dlp 路径" value={settings.ytDlpBin} placeholder="自动查找" onChange={(value) => update("ytDlpBin", value)} />
       <TextField label="YouTube 格式" value={settings.youtubeFormat} onChange={(value) => update("youtubeFormat", value)} />
@@ -456,6 +464,7 @@ function DownloadSettings({ settings, update }) {
         <Checkbox label="显示媒体信息" checked={settings.showInfo} onChange={(value) => update("showInfo", value)} />
         <Checkbox label="覆盖输出" checked={settings.overwrite} onChange={(value) => update("overwrite", value)} />
         <Checkbox label="浏览器 fallback" checked={settings.browserFallback} onChange={(value) => update("browserFallback", value)} />
+        <Checkbox label="自动使用系统浏览器主页登录态" checked={settings.systemBrowserCookies} onChange={(value) => update("systemBrowserCookies", value)} />
       </div>
     </div>
   );
@@ -489,6 +498,7 @@ function PostSettings({ settings, update }) {
       <div className="toggle-list">
         <Checkbox label="拆 WAV" checked={settings.extractAudio} onChange={(value) => update("extractAudio", value)} />
         <Checkbox label="转文字" checked={settings.transcribe} onChange={(value) => update("transcribe", value)} />
+        <Checkbox label="转写转为简体" checked={settings.simplifyChinese} onChange={(value) => update("simplifyChinese", value)} />
         <Checkbox label="X 兼容转码" checked={settings.xCompatible} onChange={(value) => update("xCompatible", value)} />
         <Checkbox label="强制 X 转码" checked={settings.xForce} onChange={(value) => update("xForce", value)} />
       </div>
@@ -588,9 +598,12 @@ function buildCommand(task, opts) {
   addOpt(args, "--output-dir", opts.outputDir !== DEFAULTS.outputDir ? opts.outputDir : "");
   addOpt(args, "--output-name", opts.outputName);
   addOpt(args, "--cookie", opts.cookie);
+  if (!opts.systemBrowserCookies) args.push("--no-system-browser-cookies");
   addOpt(args, "--timeout", opts.timeout !== DEFAULTS.timeout ? String(opts.timeout) : "");
   if (!opts.browserFallback) args.push("--no-browser-fallback");
   addOpt(args, "--browser-timeout", opts.browserTimeout !== DEFAULTS.browserTimeout ? String(opts.browserTimeout) : "");
+  addOpt(args, "--profile-limit", opts.profileLimit !== DEFAULTS.profileLimit ? String(opts.profileLimit) : "");
+  addOpt(args, "--profile-interval", opts.profileInterval !== DEFAULTS.profileInterval ? String(opts.profileInterval) : "");
   addOpt(args, "--chrome-path", opts.chromePath);
   addOpt(args, "--yt-dlp-bin", opts.ytDlpBin);
   addOpt(args, "--youtube-format", opts.youtubeFormat !== DEFAULTS.youtubeFormat ? opts.youtubeFormat : "");
@@ -611,6 +624,7 @@ function buildCommand(task, opts) {
   );
   if (opts.extractAudio) args.push("--extract-audio");
   if (opts.transcribe) args.push("--transcribe");
+  if (!opts.simplifyChinese) args.push("--no-simplify-chinese");
   addOpt(args, "--audio-output", opts.audioOutput);
   addOpt(args, "--text-output", opts.textOutput);
   addOpt(args, "--audio-sample-rate", opts.audioSampleRate !== DEFAULTS.audioSampleRate ? String(opts.audioSampleRate) : "");

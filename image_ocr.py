@@ -402,6 +402,53 @@ def render_ocr_results(results: list[OcrResult]) -> str:
     return "\n".join(chunks).rstrip() + "\n"
 
 
+def render_ocr_progress_bar(
+    completed: int,
+    total: int,
+    *,
+    current: Path | None = None,
+    width: int = 30,
+) -> str:
+    safe_total = max(1, total)
+    safe_completed = max(0, min(completed, safe_total))
+    percent = round(100 * safe_completed / safe_total)
+    filled = round(width * percent / 100)
+    line = (
+        f"ocr_progress: [{'#' * filled}{'.' * (width - filled)}] "
+        f"{percent:3d}% ({safe_completed}/{total})"
+    )
+    if current is not None:
+        line += f" processing={current.name}"
+    return line
+
+
+def print_ocr_progress_bar(
+    completed: int,
+    total: int,
+    *,
+    current: Path | None = None,
+    interactive: bool,
+) -> None:
+    line = render_ocr_progress_bar(completed, total, current=current)
+    if interactive:
+        progress_writer = getattr(sys.stderr, "write_progress", None)
+        if callable(progress_writer):
+            progress_writer(line)
+            return
+        print(f"\r{line}", end="", file=sys.stderr, flush=True)
+        return
+    print(line, file=sys.stderr, flush=True)
+
+
+def finish_ocr_progress_bar(*, interactive: bool) -> None:
+    if interactive:
+        progress_finisher = getattr(sys.stderr, "finish_progress", None)
+        if callable(progress_finisher):
+            progress_finisher()
+            return
+        print(file=sys.stderr, flush=True)
+
+
 def ocr_images(
     image_paths: list[Path],
     *,
@@ -415,6 +462,7 @@ def ocr_images(
     min_line_confidence: float | None = DEFAULT_MIN_LINE_CONFIDENCE,
     overwrite: bool = False,
     verbose: bool = False,
+    print_progress: bool = False,
 ) -> Path:
     if not image_paths:
         raise ImageOcrError("No image files were provided.")
@@ -422,18 +470,40 @@ def ocr_images(
     if output_path.exists() and not overwrite:
         raise ImageOcrError(f"OCR output already exists, pass --overwrite to replace it: {output_path}")
 
-    results = [
-        tesseract_ocr_image(
-            path,
-            tesseract_bin=tesseract_bin,
-            language=language,
-            psm=psm,
-            preprocess=preprocess,
-            min_line_confidence=min_line_confidence,
-            verbose=verbose,
+    results: list[OcrResult] = []
+    total = len(image_paths)
+    interactive_progress = sys.stderr.isatty()
+    if print_progress:
+        print_ocr_progress_bar(
+            0,
+            total,
+            current=image_paths[0],
+            interactive=interactive_progress,
         )
-        for path in image_paths
-    ]
+    try:
+        for index, path in enumerate(image_paths, start=1):
+            results.append(
+                tesseract_ocr_image(
+                    path,
+                    tesseract_bin=tesseract_bin,
+                    language=language,
+                    psm=psm,
+                    preprocess=preprocess,
+                    min_line_confidence=min_line_confidence,
+                    verbose=verbose,
+                )
+            )
+            if print_progress:
+                next_path = image_paths[index] if index < total else None
+                print_ocr_progress_bar(
+                    index,
+                    total,
+                    current=next_path,
+                    interactive=interactive_progress,
+                )
+    finally:
+        if print_progress:
+            finish_ocr_progress_bar(interactive=interactive_progress)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(render_ocr_results(results), encoding="utf-8")
     return output_path
@@ -502,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
             min_line_confidence=args.min_line_confidence,
             overwrite=args.overwrite,
             verbose=args.verbose,
+            print_progress=True,
         )
         print(f"ocr: {output_path}")
         return 0

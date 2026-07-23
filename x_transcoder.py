@@ -26,6 +26,7 @@ from typing import Any
 DEFAULT_DOWNLOAD_DIR = "downloads"
 DEFAULT_SUFFIX = "_x"
 OUTPUT_TIME_FORMAT = "%Y%m%d_%H%M%S"
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".m4v", ".ts"}
 
 
 class TranscodeError(RuntimeError):
@@ -53,6 +54,16 @@ class MediaInfo:
 class CompatibilityResult:
     ok: bool
     reasons: list[str]
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    total: int
+    compatible: int
+    converted: int
+    existing: int
+    incompatible: int
+    failed: int
 
 
 def require_binary(name: str) -> str:
@@ -156,6 +167,26 @@ def latest_video(directory: Path) -> Path:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def find_videos(
+    directory: Path,
+    *,
+    recursive: bool = True,
+    exclude_suffix: str | None = DEFAULT_SUFFIX,
+) -> list[Path]:
+    if not directory.exists():
+        raise TranscodeError(f"Directory does not exist: {directory}")
+    if not directory.is_dir():
+        raise TranscodeError(f"Input is not a directory: {directory}")
+    paths = directory.rglob("*") if recursive else directory.iterdir()
+    return sorted(
+        path
+        for path in paths
+        if path.is_file()
+        and path.suffix.lower() in VIDEO_EXTENSIONS
+        and (not exclude_suffix or not path.stem.endswith(exclude_suffix))
+    )
+
+
 def timestamp_output_name(suffix: str = "") -> str:
     return f"{time.strftime(OUTPUT_TIME_FORMAT)}{suffix}.mp4"
 
@@ -178,6 +209,18 @@ def output_path_for(
     if use_time_name:
         return parent / timestamp_output_name(suffix)
     return parent / f"{input_path.stem}{suffix}.mp4"
+
+
+def batch_output_path(
+    input_path: Path,
+    input_directory: Path,
+    output_dir: str | None,
+    suffix: str,
+) -> Path:
+    if not output_dir:
+        return output_path_for(input_path, None, None, suffix)
+    relative_parent = input_path.parent.relative_to(input_directory)
+    return Path(output_dir).expanduser() / relative_parent / f"{input_path.stem}{suffix}.mp4"
 
 
 def even_floor(value: int) -> int:
@@ -348,21 +391,134 @@ def transcode(args: argparse.Namespace, input_path: Path, output_path: Path, inf
     command = build_ffmpeg_command(args, input_path, output_path, info)
     if args.verbose:
         print(" ".join(command), file=sys.stderr)
-    completed = subprocess.run(command, check=False)
+    runner = getattr(args, "subprocess_runner", subprocess.run)
+    completed = runner(command, check=False)
     if completed.returncode != 0:
         raise TranscodeError(f"ffmpeg failed with exit code {completed.returncode}")
     return output_path
 
 
+def process_directory(args: argparse.Namespace | SimpleNamespace, directory: Path) -> BatchSummary:
+    if getattr(args, "output", None):
+        raise TranscodeError("--output cannot be used when the input is a directory; use --output-dir.")
+    check_only = bool(getattr(args, "check", False))
+    suffix = str(getattr(args, "suffix", DEFAULT_SUFFIX))
+    recursive = bool(getattr(args, "recursive", True))
+    files = find_videos(
+        directory,
+        recursive=recursive,
+        exclude_suffix=None if check_only else suffix,
+    )
+    if not files:
+        raise TranscodeError(f"No supported video files found in {directory}")
+
+    compatible_count = 0
+    converted_count = 0
+    existing_count = 0
+    incompatible_count = 0
+    failed_count = 0
+    print(
+        f"x_batch_start: folder={directory} videos={len(files)} recursive={'yes' if recursive else 'no'}"
+    )
+    for index, input_path in enumerate(files, start=1):
+        print(f"x_batch_item: {index}/{len(files)} file={input_path}")
+        try:
+            info = probe_media(input_path)
+            compatibility = check_with_options(info, args)
+            if compatibility.ok:
+                compatible_count += 1
+                print("x_compatible: yes")
+            else:
+                incompatible_count += 1
+                print("x_compatible: no")
+                for reason in compatibility.reasons:
+                    print(f"- {reason}")
+
+            if check_only:
+                continue
+            # Folder mode is incremental: compatible originals are never duplicated,
+            # even when --force was configured for single-file conversions.
+            if compatibility.ok:
+                print("x_batch_skipped: already_compatible")
+                continue
+
+            output_path = batch_output_path(
+                input_path,
+                directory,
+                getattr(args, "output_dir", None),
+                suffix,
+            )
+            if output_path.exists() and not bool(getattr(args, "overwrite", False)):
+                existing_info = probe_media(output_path)
+                existing_compatibility = check_with_options(existing_info, args)
+                if not existing_compatibility.ok:
+                    raise TranscodeError(
+                        f"Output exists but is not X-compatible; pass --overwrite: {output_path}"
+                    )
+                existing_count += 1
+                print(f"x_batch_existing: {output_path}")
+                continue
+
+            converted = transcode(args, input_path, output_path, info)
+            converted_info = probe_media(converted)
+            converted_compatibility = check_with_options(converted_info, args)
+            if not converted_compatibility.ok:
+                reasons = "; ".join(converted_compatibility.reasons)
+                raise TranscodeError(f"Converted output is not X-compatible: {reasons}")
+            converted_count += 1
+            print(f"x_batch_converted: {converted}")
+        except (OSError, TranscodeError) as exc:
+            failed_count += 1
+            print(f"x_batch_failed: {input_path}: {exc}", file=sys.stderr)
+
+    summary = BatchSummary(
+        total=len(files),
+        compatible=compatible_count,
+        converted=converted_count,
+        existing=existing_count,
+        incompatible=incompatible_count,
+        failed=failed_count,
+    )
+    print(
+        "x_batch_completed: "
+        f"total={summary.total} compatible={summary.compatible} "
+        f"incompatible={summary.incompatible} converted={summary.converted} "
+        f"existing={summary.existing} failed={summary.failed}"
+    )
+    return summary
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Transcode a video to an X-compatible MP4.")
-    parser.add_argument("input", nargs="?", help="Input video. Defaults to latest MP4/MOV in downloads/.")
+    parser.add_argument(
+        "input",
+        nargs="?",
+        help="Input video or directory. A directory is scanned recursively by default.",
+    )
     parser.add_argument("-o", "--output", help="Output file path. Default: current local time plus suffix, e.g. 20260624_153012_x.mp4")
     parser.add_argument("--output-dir", help="Output directory. Ignored when --output is set.")
     parser.add_argument("--downloads-dir", default=DEFAULT_DOWNLOAD_DIR, help="Directory used when input is omitted. Default: downloads")
     parser.add_argument("--suffix", default=DEFAULT_SUFFIX, help="Suffix for default output filename. Default: _x")
     parser.add_argument("--check", action="store_true", help="Only check compatibility; do not transcode.")
-    parser.add_argument("--force", action="store_true", help="Transcode even when the input already looks compatible.")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Transcode an already compatible single-file input; directory mode always skips it.",
+    )
+    recursive_group = parser.add_mutually_exclusive_group()
+    recursive_group.add_argument(
+        "--recursive",
+        dest="recursive",
+        action="store_true",
+        default=True,
+        help="Recursively scan a directory input. Default: enabled",
+    )
+    recursive_group.add_argument(
+        "--no-recursive",
+        dest="recursive",
+        action="store_false",
+        help="Only scan video files directly inside the input directory.",
+    )
     parser.add_argument("--overwrite", action="store_true", help="Overwrite output if it already exists.")
     parser.add_argument("--crf", type=int, default=23, help="x264 CRF quality. Lower is larger/better. Default: 23")
     parser.add_argument("--preset", default="medium", help="x264 preset. Default: medium")
@@ -385,6 +541,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     try:
         input_path = Path(args.input).expanduser() if args.input else latest_video(Path(args.downloads_dir).expanduser())
+        if input_path.is_dir():
+            summary = process_directory(args, input_path)
+            if summary.failed:
+                return 1
+            if args.check and summary.incompatible:
+                return 2
+            return 0
+
         info = probe_media(input_path)
         compatibility = check_with_options(info, args)
         print_media_summary(info, compatibility)

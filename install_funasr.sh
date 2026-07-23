@@ -168,8 +168,8 @@ install_packages() {
         "$venv_python" -m pip install torch torchaudio
     fi
 
-    log "Installing FunASR and ModelScope"
-    "$venv_python" -m pip install funasr modelscope
+    log "Installing FunASR, ModelScope, and OpenCC"
+    "$venv_python" -m pip install funasr modelscope opencc-python-reimplemented
 }
 
 verify_install() {
@@ -180,6 +180,7 @@ verify_install() {
     "$venv_python" - <<'PY'
 import funasr
 import modelscope
+import opencc
 import torch
 import torchaudio
 
@@ -188,6 +189,7 @@ print("torch:", torch.__version__, "cuda:", torch.cuda.is_available())
 print("torchaudio:", torchaudio.__version__)
 print("funasr:", getattr(funasr, "__version__", "installed"))
 print("modelscope:", getattr(modelscope, "__version__", "installed"))
+print("opencc:", getattr(opencc, "__version__", "installed"))
 PY
 
     if [[ "$install_mode" == "cuda" ]]; then
@@ -244,7 +246,7 @@ print_plan() {
         printf '\n'
     fi
     printf '  funasr_command: '
-    shell_join "$VENV_DIR/bin/python" -m pip install funasr modelscope
+    shell_join "$VENV_DIR/bin/python" -m pip install funasr modelscope opencc-python-reimplemented
     printf '\n'
     printf '  preload_models: %s\n' "$([[ "$PRELOAD_MODELS" == 1 ]] && printf 'yes' || printf 'no')"
 }

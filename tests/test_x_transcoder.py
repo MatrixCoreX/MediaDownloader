@@ -1,4 +1,6 @@
+import io
 from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -49,6 +51,61 @@ class XTranscoderTests(unittest.TestCase):
         with mock.patch("x_transcoder.time.strftime", return_value="20260624_153012"):
             path = xt.output_path_for(Path("downloads/a.mp4"), None, None, "_x", use_time_name=True)
         self.assertEqual(path, Path("downloads/20260624_153012_x.mp4"))
+
+    def test_find_videos_recurses_and_excludes_generated_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            nested = root / "nested"
+            nested.mkdir()
+            (root / "a.mp4").write_bytes(b"")
+            (nested / "b.mkv").write_bytes(b"")
+            (nested / "b_x.mp4").write_bytes(b"")
+            (nested / "notes.txt").write_text("not a video", encoding="utf-8")
+
+            self.assertEqual(
+                xt.find_videos(root),
+                [root / "a.mp4", nested / "b.mkv"],
+            )
+            self.assertEqual(
+                xt.find_videos(root, recursive=False),
+                [root / "a.mp4"],
+            )
+
+    def test_process_directory_checks_all_and_converts_only_incompatible_video(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            compatible_path = root / "compatible.mp4"
+            incompatible_path = root / "incompatible.webm"
+            compatible_path.write_bytes(b"compatible")
+            incompatible_path.write_bytes(b"incompatible")
+            options = xt.default_options(
+                check=False,
+                # --force is a single-file option; folder mode must still skip
+                # compatible originals instead of creating duplicates.
+                force=True,
+                output=None,
+                output_dir=None,
+                suffix="_x",
+                recursive=True,
+            )
+
+            def fake_probe(path: Path):
+                if path == incompatible_path:
+                    return media_info(path=path, video_codec="vp9", container="webm")
+                return media_info(path=path)
+
+            with mock.patch("x_transcoder.probe_media", side_effect=fake_probe), mock.patch(
+                "x_transcoder.transcode",
+                side_effect=lambda _args, _input, output, _info: output,
+            ) as transcode_mock, mock.patch("sys.stdout", new_callable=io.StringIO):
+                summary = xt.process_directory(options, root)
+
+            self.assertEqual(summary.total, 2)
+            self.assertEqual(summary.compatible, 1)
+            self.assertEqual(summary.incompatible, 1)
+            self.assertEqual(summary.converted, 1)
+            self.assertEqual(summary.failed, 0)
+            self.assertEqual(transcode_mock.call_args.args[2], root / "incompatible_x.mp4")
 
 
 if __name__ == "__main__":

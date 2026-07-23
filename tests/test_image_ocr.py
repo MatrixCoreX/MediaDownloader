@@ -1,3 +1,4 @@
+import io
 import subprocess
 import tempfile
 import unittest
@@ -18,6 +19,44 @@ class ImageOcrTests(unittest.TestCase):
 
     def test_normalize_ocr_text_strips_form_feed_and_outer_blank_lines(self) -> None:
         self.assertEqual(image_ocr.normalize_ocr_text("\n  hello  \nworld\f\n\n"), "  hello\nworld")
+
+    def test_render_ocr_progress_bar_includes_percent_count_and_current_file(self) -> None:
+        rendered = image_ocr.render_ocr_progress_bar(
+            1,
+            4,
+            current=Path("downloads/two.jpg"),
+        )
+        self.assertIn(" 25%", rendered)
+        self.assertIn("(1/4)", rendered)
+        self.assertIn("processing=two.jpg", rendered)
+
+    def test_ocr_progress_uses_interactive_prompt_stream(self) -> None:
+        class ProgressStream(io.StringIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.progress: list[str] = []
+                self.finished = False
+
+            def write_progress(self, line: str) -> None:
+                self.progress.append(line)
+
+            def finish_progress(self) -> None:
+                self.finished = True
+
+        stderr = ProgressStream()
+        with mock.patch("image_ocr.sys.stderr", stderr):
+            image_ocr.print_ocr_progress_bar(
+                2,
+                5,
+                current=Path("three.jpg"),
+                interactive=True,
+            )
+            image_ocr.finish_ocr_progress_bar(interactive=True)
+
+        self.assertEqual(len(stderr.progress), 1)
+        self.assertIn(" 40% (2/5) processing=three.jpg", stderr.progress[0])
+        self.assertTrue(stderr.finished)
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_output_path_for_single_image(self) -> None:
         self.assertEqual(
@@ -204,6 +243,33 @@ class ImageOcrTests(unittest.TestCase):
             text = output_path.read_text(encoding="utf-8")
             self.assertIn(f"## {first}\nfirst", text)
             self.assertIn(f"## {second}\nsecond", text)
+
+    def test_ocr_images_prints_progress_from_zero_through_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first = Path(tmpdir) / "first.jpg"
+            second = Path(tmpdir) / "second.jpg"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            output_path = Path(tmpdir) / "combined.txt"
+
+            def fake_ocr(path: Path, **_kwargs: object) -> image_ocr.OcrResult:
+                return image_ocr.OcrResult(path, path.stem)
+
+            with mock.patch("image_ocr.tesseract_ocr_image", side_effect=fake_ocr), mock.patch(
+                "image_ocr.sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                image_ocr.ocr_images(
+                    [first, second],
+                    output=str(output_path),
+                    print_progress=True,
+                )
+
+            progress_lines = stderr.getvalue().splitlines()
+            self.assertEqual(len(progress_lines), 3)
+            self.assertIn("  0% (0/2) processing=first.jpg", progress_lines[0])
+            self.assertIn(" 50% (1/2) processing=second.jpg", progress_lines[1])
+            self.assertIn("100% (2/2)", progress_lines[2])
 
     def test_ocr_images_passes_preprocess_option(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
