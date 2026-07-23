@@ -459,6 +459,15 @@ python3 media_downloader.py \
 
 OCR 是默认开启的可选后处理：如果本机没有安装 `tesseract` 或语言包缺失，图片仍会正常保存，程序只会向 `stderr` 打印 `warning: Image OCR skipped: ...` 并跳过 OCR。
 
+Pillow 是推荐安装的 OCR 图片预处理依赖，用于放大图片、灰度转换、增强对比度和生成黑白图。它必须安装在实际运行下载器的 Python 环境中；如果使用项目 `.venv`，执行：
+
+```bash
+.venv/bin/python -m pip install Pillow
+.venv/bin/python -c 'from PIL import Image; print(Image.__version__)'
+```
+
+缺少 Pillow 不影响图片、视频下载和视频转码，OCR 也会自动回退为只识别原图，但低分辨率文字图片的识别率可能下降。
+
 OCR 执行时会打印 `ocr_progress` 进度条，包含百分比、已完成图片数和当前图片名；交互终端中会在输入框上方原地刷新，普通管道或日志环境中则逐行输出，避免长时间识别时看起来像卡死。
 
 默认语言是 `chi_sim`，用于识别简体中文。默认会把原图和 Pillow 预处理图都交给 Tesseract `psm 6` + LSTM 引擎识别，然后按行级置信度自动选择更好的结果。预处理图会放大 2 倍、增强对比度并转成黑白图，适合大字文字卡片；原图通常更适合长段宋体/衬线字体。识别结果还会通过 Tesseract TSV 行级置信度过滤一次，默认丢弃低于 `15` 的行，减少插画、图标、表情被误识别成文字的情况。识别结果会保存到一个 TXT 文件，路径默认基于图片序列前缀生成：
@@ -1032,6 +1041,12 @@ Debian/Ubuntu 示例：
 ```bash
 sudo apt update
 sudo apt install ffmpeg chromium yt-dlp tesseract-ocr tesseract-ocr-chi-sim tesseract-ocr-eng python3-pil
+```
+
+上面的 `python3-pil` 供 Ubuntu 系统 Python 使用。项目 `.venv` 默认与系统 Python 包隔离；如果用 `.venv/bin/python media_downloader.py ...` 启动下载器，还需要把 Pillow 安装到 `.venv`：
+
+```bash
+.venv/bin/python -m pip install Pillow
 ```
 
 macOS 示例：
