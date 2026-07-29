@@ -339,6 +339,9 @@ def build_ffmpeg_command(args: argparse.Namespace, input_path: Path, output_path
     command = [
         ffmpeg,
         "-hide_banner",
+        # X transcoding can run on the interactive queue's worker thread.
+        # Do not let ffmpeg consume keystrokes intended for the main prompt.
+        "-nostdin",
         "-y" if args.overwrite else "-n",
         "-i",
         str(input_path),

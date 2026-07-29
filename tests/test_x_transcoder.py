@@ -43,6 +43,19 @@ class XTranscoderTests(unittest.TestCase):
     def test_target_dimensions_scale_large_portrait(self) -> None:
         self.assertEqual(xt.target_dimensions(media_info(width=2160, height=3840), (1920, 1080), (1080, 1920)), (1080, 1920))
 
+    def test_ffmpeg_does_not_consume_interactive_queue_input(self) -> None:
+        options = xt.default_options()
+        with mock.patch("x_transcoder.require_binary", return_value="ffmpeg"):
+            command = xt.build_ffmpeg_command(
+                options,
+                Path("downloads/input.mp4"),
+                Path("downloads/input_x.mp4"),
+                media_info(),
+            )
+
+        self.assertIn("-nostdin", command)
+        self.assertLess(command.index("-nostdin"), command.index("-i"))
+
     def test_default_output_path_adds_suffix(self) -> None:
         path = xt.output_path_for(Path("downloads/a.mp4"), None, None, "_x")
         self.assertEqual(path, Path("downloads/a_x.mp4"))

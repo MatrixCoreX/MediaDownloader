@@ -973,10 +973,22 @@ class DouyinDownloaderTests(unittest.TestCase):
     def test_interactive_loop_prints_parse_attempts(self) -> None:
         args = dd.parse_args(["--interactive", "--print-url"])
         candidate = dd.Candidate("https://example.com/video.mp4", "test", 1)
+        parse_started = threading.Event()
         responses = iter(["https://v.douyin.com/abc123/", "q"])
-        with mock.patch("builtins.input", side_effect=lambda _prompt: next(responses)), mock.patch(
+
+        def fake_input(_prompt: str) -> str:
+            response = next(responses)
+            if response == "q":
+                self.assertTrue(parse_started.wait(timeout=1))
+            return response
+
+        def fake_gather(*_args, **_kwargs):
+            parse_started.set()
+            return "douyin", "7441234567890123456", [candidate], [], []
+
+        with mock.patch("builtins.input", side_effect=fake_input), mock.patch(
             "media_downloader.gather_candidates_for_request",
-            return_value=("douyin", "7441234567890123456", [candidate], [], []),
+            side_effect=fake_gather,
         ):
             with mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
                 "sys.stderr",
@@ -1588,6 +1600,7 @@ class DouyinDownloaderTests(unittest.TestCase):
 
     def test_interactive_loop_applies_commands_before_download(self) -> None:
         args = dd.parse_args(["--interactive"])
+        task_started = threading.Event()
         responses = iter(
             [
                 ":transcribe on",
@@ -1605,9 +1618,16 @@ class DouyinDownloaderTests(unittest.TestCase):
         ) -> int:
             assert isinstance(current_args, argparse.Namespace)
             calls.append((current_args.transcribe, current_args.audio_output, share_text, cookie))
+            task_started.set()
             return 0
 
-        with mock.patch("builtins.input", side_effect=lambda _prompt: next(responses)), mock.patch(
+        def fake_input(_prompt: str) -> str:
+            response = next(responses)
+            if response == ":quit":
+                self.assertTrue(task_started.wait(timeout=1))
+            return response
+
+        with mock.patch("builtins.input", side_effect=fake_input), mock.patch(
             "media_downloader.handle_share_text",
             side_effect=fake_handle_share_text,
         ):
@@ -1619,11 +1639,10 @@ class DouyinDownloaderTests(unittest.TestCase):
 
         self.assertEqual(calls, [(True, "downloads/custom.wav", "https://v.douyin.com/abc123/", None)])
 
-    def test_interactive_loop_accepts_another_task_while_worker_is_busy(self) -> None:
+    def test_interactive_loop_accepts_another_task_while_busy_then_cancels_on_exit(self) -> None:
         args = dd.parse_args(["--interactive"])
         first_started = threading.Event()
         first_finished = threading.Event()
-        release_first = threading.Event()
         responses = iter(["first task", "second task", ":quit"])
         accepted_while_busy: list[bool] = []
         calls: list[str] = []
@@ -1633,8 +1652,6 @@ class DouyinDownloaderTests(unittest.TestCase):
             if response == "second task":
                 first_started.wait(timeout=1)
                 accepted_while_busy.append(not first_finished.is_set())
-            elif response == ":quit":
-                release_first.set()
             return response
 
         def fake_handle_share_text(
@@ -1644,9 +1661,15 @@ class DouyinDownloaderTests(unittest.TestCase):
         ) -> int:
             calls.append(share_text)
             if share_text == "first task":
+                token = dd.current_cancellation_token()
+                self.assertIsNotNone(token)
                 first_started.set()
-                release_first.wait(timeout=2)
-                first_finished.set()
+                try:
+                    assert token is not None
+                    token.wait(timeout=2)
+                    token.raise_if_cancelled()
+                finally:
+                    first_finished.set()
             return 0
 
         with mock.patch("builtins.input", side_effect=fake_input), mock.patch(
@@ -1659,7 +1682,53 @@ class DouyinDownloaderTests(unittest.TestCase):
             self.assertEqual(dd.interactive_loop(args, None), 0)
 
         self.assertEqual(accepted_while_busy, [True])
-        self.assertEqual(calls, ["first task", "second task"])
+        self.assertTrue(first_finished.is_set())
+        self.assertEqual(calls, ["first task"])
+
+    def test_interactive_exit_terminates_running_x_transcoder_process(self) -> None:
+        args = dd.parse_args(["--interactive"])
+        process_registered = threading.Event()
+        original_register_process = dd.CancellationToken.register_process
+
+        def register_process(token, process) -> None:
+            original_register_process(token, process)
+            process_registered.set()
+
+        def fake_x_file_handler(_args: argparse.Namespace) -> int:
+            completed = dd.run_task_subprocess(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                check=False,
+            )
+            return completed.returncode
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video_path = Path(tmpdir) / "input.mp4"
+            video_path.write_bytes(b"video")
+            responses = iter([f':x-file "{video_path}"', ":quit"])
+
+            def fake_input(_prompt: str) -> str:
+                response = next(responses)
+                if response == ":quit":
+                    self.assertTrue(process_registered.wait(timeout=2))
+                return response
+
+            started_at = time.monotonic()
+            with mock.patch("builtins.input", side_effect=fake_input), mock.patch(
+                "media_downloader.process_x_file",
+                side_effect=fake_x_file_handler,
+            ), mock.patch.object(
+                dd.CancellationToken,
+                "register_process",
+                new=register_process,
+            ), mock.patch("sys.stdout", new_callable=io.StringIO), mock.patch(
+                "sys.stderr",
+                new_callable=io.StringIO,
+            ) as stderr:
+                self.assertEqual(dd.interactive_loop(args, None), 0)
+
+        self.assertLess(time.monotonic() - started_at, 5)
+        self.assertIn("queue_shutdown: cancelling 1 task(s)", stderr.getvalue())
+        self.assertIn("task_cancelled: #1", stderr.getvalue())
 
     def test_interactive_history_loads_prints_and_saves(self) -> None:
         fake_readline = FakeReadline()

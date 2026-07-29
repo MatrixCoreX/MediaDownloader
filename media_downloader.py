@@ -5490,7 +5490,7 @@ def print_interactive_help() -> None:
                 "  :<option> on|off              shortcut for booleans",
                 "  :<option> <value>             shortcut for values",
                 "  <profile URL> all             queue all Douyin/Xiaohongshu profile posts",
-                "  :quit                         exit interactive mode",
+                "  :quit                         cancel tasks and exit interactive mode",
                 "Boolean options:",
                 "  "
                 + ", ".join(
@@ -7110,7 +7110,7 @@ def interactive_loop(args: argparse.Namespace, cookie: str | None) -> int:
     print("Use :ocr-file <image> to queue OCR for one local image.")
     print("Use :x-file <video> to queue one local video for X-compatible processing.")
     print("Use :x-folder <directory> or :x <directory> to queue X-compatible folder processing.")
-    print("Type :queue to show jobs, :cancel to cancel jobs, :help for commands, or exit/quit/q to stop.")
+    print("Type :queue to show jobs, :cancel to cancel jobs, :help for commands, or exit/quit/q to cancel and stop.")
     active_cookie = cookie
     history_path = setup_interactive_history()
     prompt_console = InteractivePromptConsole()
@@ -7160,7 +7160,12 @@ def interactive_loop(args: argparse.Namespace, cookie: str | None) -> int:
         if task_queue is not None:
             active_tasks = task_queue.active_count()
             if active_tasks:
-                print(f"queue_shutdown: waiting for {active_tasks} task(s) to finish", file=sys.stderr, flush=True)
+                print(
+                    f"queue_shutdown: cancelling {active_tasks} task(s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            task_queue.cancel_all()
             task_queue.shutdown(wait=True)
         prompt_console.restore()
         save_interactive_history(history_path)
